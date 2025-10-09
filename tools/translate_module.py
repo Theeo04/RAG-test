@@ -172,11 +172,14 @@ def _rule_based(query: str,
     manifests: List[Dict[str, Any]] = []
     notes: List[str] = []
 
-    # --- Detectare "create <workload>" generic ---
-    creating = any(w in ql for w in ["creeaza", "creaza", "creați", "create", "adauga", "adaugă", "add", "genereaza", "generează"])
+    # --- Detectare "create <workload>" generic (din ENV configurabil) ---
+    create_words = set(os.getenv("RAG_CREATE_WORDS", "creeaza,creaza,creați,create,adauga,adaugă,add,genereaza,generează").lower().split(","))
+    creating = any(w and w in ql for w in create_words)
+
+    kinds_words = [w.strip().lower() for w in os.getenv("RAG_WORKLOAD_KINDS", "deployment,statefulset,daemonset,job,cronjob").split(",") if w.strip()]
     kind_word = None
-    for kw in ["deployment", "statefulset", "daemonset", "job", "cronjob"]:
-        if re.search(rf"\b{kw}\b", ql):
+    for kw in kinds_words:
+        if re.search(rf"\b{re.escape(kw)}\b", ql):
             kind_word = kw.capitalize() if kw != "cronjob" else "CronJob"
             break
     target_kind = kind_word or ("Deployment" if creating else "")
@@ -185,9 +188,10 @@ def _rule_based(query: str,
     image_match = re.search(r"\bimage\s*[:=]\s*([a-z0-9./:_-]+)", q, flags=re.IGNORECASE)
     init_hint = ("initcontainer" in ql) or ("init container" in ql) or ("init-cont" in ql)
 
-    # fallback semantic: dacă se menționează „nginx” dar nu există image, presupunem nginx:latest
+    default_image = os.getenv("RAG_DEFAULT_IMAGE", "nginx:latest")
+    # fallback semantic: dacă se menționează „nginx” dar nu există image, presupunem default_image
     if "nginx" in ql and not image_match:
-        image_match = re.search(r"(nginx)(?::([a-z0-9._-]+))?", "nginx:latest", flags=re.IGNORECASE)
+        image_match = re.search(r"(nginx)(?::([a-z0-9._-]+))?", default_image, flags=re.IGNORECASE)
 
     if creating and target_kind:
         if allowed_kinds and target_kind not in allowed_kinds:
@@ -197,7 +201,7 @@ def _rule_based(query: str,
                 "kind": target_kind,
                 "name": (name_match.group(1) if name_match else "app"),
                 "params": {
-                    "image": (image_match.group(0) if image_match else "nginx:latest"),
+                    "image": (image_match.group(0) if image_match else default_image),
                     "withInitContainer": bool(init_hint),
                     "replicas": 1
                 },
@@ -209,43 +213,69 @@ def _rule_based(query: str,
                 "kind": target_kind,
                 "name": (name_match.group(1) if name_match else "app"),
                 "params": {
-                    "image": (image_match.group(0) if image_match else "nginx:latest"),
+                    "image": (image_match.group(0) if image_match else default_image),
                     "withInitContainer": bool(init_hint),
                     "replicas": 1
                 }
             })
 
-    # --- Replicas (generic) ---
+    # --- Replicas (dinamically pick from candidates) ---
     m_rep = re.search(r"\breplicas?\s*(?:=|:)?\s*(\d+)\b", ql)
     if m_rep:
         val = m_rep.group(1)
-        prefer = _maybe_pick_key(candidates, "replica count") or _maybe_pick_key(candidates, "replicas")
-        for cand in [prefer, "replicaCount", "replicas"]:
-            if cand and cand in candidates:
-                intents.append({"op": "set", "key": cand, "value": val})
-                break
+        # prefer keys that contain 'replica' anywhere
+        replica_keys = [k for k in candidates if "replica" in k.lower()]
+        pick = _best_key_semantic("replicas", set(replica_keys)) if replica_keys else _maybe_pick_key(candidates, "replica")
+        if pick and pick in candidates:
+            intents.append({"op": "set", "key": pick, "value": val})
+        else:
+            # fallback configurable
+            fallback_replica_keys = [k.strip() for k in os.getenv("RAG_REPLICA_KEYS", "replicaCount,replicas").split(",") if k.strip()]
+            for rk in fallback_replica_keys:
+                intents.append({"op": "set", "key": rk, "value": val})
+            notes.append("no replica keys in plan; used fallback RAG_REPLICA_KEYS")
 
-    # --- CPU (generic) ---
+    # --- CPU (dinamically: all matching *.cpu in candidates) ---
     if "cpu" in ql:
         m_cpu = re.search(r"\bcpu[^0-9a-zA-Z]{0,3}(\d+m|\d+(?:\.\d+)?)", ql)
         if not m_cpu:
             m_cpu = re.search(r"\b(\d+m)\b", ql)
         if m_cpu:
             cpu_val = _normalize_cpu_value(m_cpu.group(1))
-            for cand in ["resources.requests.cpu", "resources.limits.cpu"]:
-                if cand in candidates:
-                    intents.append({"op": "set", "key": cand, "value": cpu_val})
+            cpu_keys = [k for k in candidates if k.lower().endswith(".cpu")]
+            req_cpu = [k for k in cpu_keys if ".requests." in k.lower()]
+            lim_cpu = [k for k in cpu_keys if ".limits." in k.lower()]
+            chosen = req_cpu + lim_cpu if (req_cpu or lim_cpu) else cpu_keys
+            if chosen:
+                for ck in sorted(set(chosen)):
+                    intents.append({"op": "set", "key": ck, "value": cpu_val})
+            else:
+                # fallback configurable
+                fallback_cpu_keys = [k.strip() for k in os.getenv("RAG_CPU_KEYS", "resources.requests.cpu,resources.limits.cpu").split(",") if k.strip()]
+                for ck in fallback_cpu_keys:
+                    intents.append({"op": "set", "key": ck, "value": cpu_val})
+                notes.append("no CPU keys in plan; used fallback RAG_CPU_KEYS")
 
-    # --- Memory (generic) ---
+    # --- Memory (dinamically: all matching *.memory in candidates) ---
     if "mem" in ql or "memory" in ql:
         m_mem = re.search(r"\b(\d+(?:Ki|Mi|Gi|Ti|Pi|Ei))\b", q)
         if not m_mem:
             m_mem = re.search(r"\bmemory[^0-9a-zA-Z]{0,3}(\d+(?:Ki|Mi|Gi|Ti|Pi|Ei))\b", q, re.IGNORECASE)
         if m_mem:
             mem_val = _normalize_mem_value(m_mem.group(1))
-            for cand in ["resources.requests.memory", "resources.limits.memory"]:
-                if cand in candidates:
-                    intents.append({"op": "set", "key": cand, "value": mem_val})
+            mem_keys = [k for k in candidates if k.lower().endswith(".memory")]
+            req_mem = [k for k in mem_keys if ".requests." in k.lower()]
+            lim_mem = [k for k in mem_keys if ".limits." in k.lower()]
+            chosen = req_mem + lim_mem if (req_mem or lim_mem) else mem_keys
+            if chosen:
+                for mk in sorted(set(chosen)):
+                    intents.append({"op": "set", "key": mk, "value": mem_val})
+            else:
+                # fallback configurable
+                fallback_mem_keys = [k.strip() for k in os.getenv("RAG_MEM_KEYS", "resources.requests.memory,resources.limits.memory").split(",") if k.strip()]
+                for mk in fallback_mem_keys:
+                    intents.append({"op": "set", "key": mk, "value": mem_val})
+                notes.append("no memory keys in plan; used fallback RAG_MEM_KEYS")
 
     # --- Image repo:tag (generic) ---
     m_img = image_match or _IMG_RE.search(q)
@@ -370,6 +400,14 @@ def _llm_prompt(query: str, candidates: Set[str], allowed_kinds: Set[str]) -> st
     ]
 
     return "\n".join(lines)
+
+def build_llm_prompt(query: str, plan: Dict[str, Any]) -> str:
+    """
+    Public helper: builds the exact LLM prompt using the allow-lists from the current plan.
+    Useful for debugging or for a human-readable view of what will be sent to the LLM.
+    """
+    candidates, _, allowed_kinds = _collect_from_plan(plan)
+    return _llm_prompt(query, candidates, allowed_kinds)
 
 # ============================= API principal =============================
 def translate_intents(query: str,

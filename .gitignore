@@ -1,13 +1,11 @@
+# Python
 __pycache__/
 *.pyc
 .venv/
-node_modules/
-dist/
-build/
-.next/
-.DS_Store
-.idea/
-.vscode/
-out/
+# RAG/FAISS cache
 .rag/
-*.log
+# IDE
+.vscode/
+.idea/
+# Output
+out/

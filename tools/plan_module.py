@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from collections import defaultdict
 from functools import lru_cache
 import numpy as np
+import re
 
 # Folosim același model ca indexarea (poți schimba prin env sau argument, dacă vrei)
 DEFAULT_MODEL_NAME = "all-MiniLM-L6-v2"
@@ -116,23 +117,75 @@ def _minmax_norm(d: Dict[str, float]) -> Dict[str, float]:
         return {k: 0.0 for k in d.keys()}
     return {k: (v - mn) / (mx - mn) for k, v in d.items()}
 
+def _component_key_features(meta: List[Dict[str, Any]]) -> Dict[str, Dict[str, bool]]:
+    """
+    Pentru fiecare componentă, detectează prezența unor categorii de chei:
+    - has_cpu: există chei care se termină cu .cpu
+    - has_mem: există chei care se termină cu .memory
+    - has_replica: există chei care conțin 'replica'
+    """
+    feats = defaultdict(lambda: {"has_cpu": False, "has_mem": False, "has_replica": False})
+    for r in meta:
+        if r.get("type") != "values":
+            continue
+        c = r["component"]
+        for k in r.get("yaml_keys") or []:
+            kl = str(k).lower()
+            if kl.endswith(".cpu"):
+                feats[c]["has_cpu"] = True
+            if kl.endswith(".memory"):
+                feats[c]["has_mem"] = True
+            if "replica" in kl:
+                feats[c]["has_replica"] = True
+    return feats
+
+def _affinity_flags_from_query(q: str) -> Dict[str, bool]:
+    ql = (q or "").lower()
+    return {
+        "need_cpu": ("cpu" in ql),
+        "need_mem": ("mem" in ql) or ("memory" in ql),
+        "need_replica": bool(re.search(r"\breplicas?\b", ql)),
+    }
+
+def _affinity_score_components(query: str, meta: List[Dict[str, Any]]) -> Dict[str, float]:
+    """
+    Scor simplu: +1 per categorie de cheie necesară de query și prezentă în componentă.
+    """
+    flags = _affinity_flags_from_query(query)
+    feats = _component_key_features(meta)
+    scores: Dict[str, float] = {}
+    for c, f in feats.items():
+        s = 0.0
+        if flags["need_cpu"] and f["has_cpu"]:
+            s += 1.0
+        if flags["need_mem"] and f["has_mem"]:
+            s += 1.0
+        if flags["need_replica"] and f["has_replica"]:
+            s += 1.0
+        scores[c] = s
+    return scores
+
 def _fuse_scores(sem: Dict[str, float],
                  search: Dict[str, float],
+                 affinity: Dict[str, float],
                  w_sem: float = 0.7,
-                 w_search: float = 0.3) -> Dict[str, Dict[str, float]]:
+                 w_search: float = 0.3,
+                 w_aff: float = 0.0) -> Dict[str, Dict[str, float]]:
     """
-    Întoarce map component -> {"semantic": x, "search": y, "final": z}
-    Normalizăm fiecare canal separat în [0,1], apoi facem combinația liniară.
+    Întoarce map component -> {"semantic": x, "search": y, "affinity": a, "final": z}
+    Normalizăm fiecare canal separat în [0,1], apoi combinăm liniar.
     """
-    comps = sorted(set(list(sem.keys()) + list(search.keys())))
+    comps = sorted(set(list(sem.keys()) + list(search.keys()) + list(affinity.keys())))
     sem_n = _minmax_norm(sem)
     sea_n = _minmax_norm(search)
+    aff_n = _minmax_norm(affinity)
     out = {}
     for c in comps:
         s1 = sem_n.get(c, 0.0)
         s2 = sea_n.get(c, 0.0)
-        z = w_sem * s1 + w_search * s2
-        out[c] = {"semantic": s1, "search": s2, "final": z}
+        s3 = aff_n.get(c, 0.0)
+        z = w_sem * s1 + w_search * s2 + w_aff * s3
+        out[c] = {"semantic": s1, "search": s2, "affinity": s3, "final": z}
     return out
 
 def _rank_components(signals: Dict[str, Dict[str, float]]) -> List[Dict[str, Any]]:
@@ -149,7 +202,8 @@ def _rank_components(signals: Dict[str, Dict[str, float]]) -> List[Dict[str, Any
          "count": None,  # nu mai folosim count-ul brut din search
          "signals": {
              "semantic_norm": round(sig["semantic"], 6),
-             "search_norm": round(sig["search"], 6)
+             "search_norm": round(sig["search"], 6),
+             "affinity_norm": round(sig.get("affinity", 0.0), 6),
          }}
         for c, sig in ordered
     ]
@@ -203,9 +257,17 @@ def do_plan(root: str,
     # 4) scorul de căutare agregat pe componentă din rezultatele top-N
     sea_scores = _search_rank_components(results)
 
+    # 4.1) scor de "afinitate" în funcție de cheile existente în componentă vs cerințele query-ului
+    aff_scores = _affinity_score_components(query, meta)
+
     # 5) fuziune
-    w = weights or {"semantic": 0.7, "search": 0.3}
-    fused = _fuse_scores(sem_scores, sea_scores, w_sem=w["semantic"], w_search=w["search"])
+    w = weights or {"semantic": 0.7, "search": 0.3, "affinity": 0.0}
+    fused = _fuse_scores(
+        sem_scores, sea_scores, aff_scores,
+        w_sem=w.get("semantic", 0.7),
+        w_search=w.get("search", 0.3),
+        w_aff=w.get("affinity", 0.0)
+    )
     comp_rank = _rank_components(fused)
 
     if not comp_rank:

@@ -6,6 +6,8 @@ import argparse, os, sys, json, time, glob, pathlib, re, hashlib
 from tools.plan_module import do_plan as plan_do
 from tools.patch_module import patch_from_plan
 from tools.translate_module import translate_intents
+from tools.translate_module import build_llm_prompt
+from tools.config import RAGConfig
 
 from typing import List, Dict, Any, Optional, Tuple
 from collections import defaultdict
@@ -20,11 +22,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 
 # ---------------------------- Config implicite ----------------------------
-MODEL_NAME = "all-MiniLM-L6-v2"   # rapid & bun pentru config
-CHUNK_SIZE = 1000                 # 800–1200 e ok pt YAML/config
-RRF_K = 60                        # constantă RRF
-DENSE_WEIGHT = 0.6                # pondere dense vs BM25/TFIDF
-BM25_WEIGHT = 0.4
+# REMOVED hardcoded defaults; all come from RAGConfig loaded per --root
 
 # ---------------------------- Utilitare IO ----------------------------
 def read_text(p: str) -> str:
@@ -41,8 +39,8 @@ def sha256_file(p: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-def list_files(root: str) -> List[str]:
-    patterns = ["**/*.yaml", "**/*.yml", "**/*.md", "**/*.txt", "**/*.conf", "**/*.py"]
+def list_files(root: str, cfg: RAGConfig) -> List[str]:
+    patterns = cfg.file_globs
     files: List[str] = []
     for pat in patterns:
         files += glob.glob(os.path.join(root, pat), recursive=True)
@@ -54,17 +52,28 @@ HELM_BLOCK_COMMENT = re.compile(r"{{-?/\*.*?\*/-?}}", re.DOTALL)
 HELM_INLINE = re.compile(r"{{-?\s*.*?\s*-?}}")
 KEY_LINE = re.compile(r"^(\s*)([A-Za-z0-9_.-]+):\s*(?:[^>|].*)?$")
 
-def classify(path: str) -> Dict[str, Optional[str]]:
-    p = path.replace("\\", "/")
-    parts = p.split("/")
-    comp = parts[1] if len(parts) > 1 else pathlib.Path(p).parent.name
+def classify(root: str, path: str, cfg: RAGConfig) -> Dict[str, Optional[str]]:
+    # component as first segment relative to root
+    try:
+        rel = pathlib.Path(path).resolve().relative_to(pathlib.Path(root).resolve())
+        parts = str(rel).replace("\\", "/").split("/")
+        comp = parts[0] if parts and parts[0] else pathlib.Path(path).parent.name
+    except Exception:
+        comp = pathlib.Path(path).parent.name
+
+    lower = path.lower()
     t = "config"; profile = None
-    lower = p.lower()
-    if lower.endswith("readme.md"):
+
+    def _match(globs: List[str]) -> bool:
+        import fnmatch
+        relp = str(pathlib.Path(path))
+        return any(fnmatch.fnmatch(relp, os.path.join(root, g)) or fnmatch.fnmatch(relp, g) for g in globs)
+
+    if _match(cfg.readme_globs):
         t = "readme"
-    elif "/values/" in lower and (lower.endswith(".yaml") or lower.endswith(".yml")):
-        t = "values"; profile = pathlib.Path(p).stem
-    elif lower.endswith((".yaml", ".yml")):
+    elif _match(cfg.values_globs):
+        t = "values"; profile = pathlib.Path(path).stem
+    elif _match(cfg.manifest_globs):
         t = "manifest"
     return {"component": comp, "type": t, "profile": profile}
 
@@ -132,18 +141,18 @@ def extract_yaml_keys_from_file(path: str) -> List[str]:
 def extract_kinds(text: str) -> List[str]:
     return sorted(set(KIND_RE.findall(text)))
 
-def chunk_text(text: str, n: int = CHUNK_SIZE) -> List[str]:
-    if len(text) <= n:
+def chunk_text(text: str, n: Optional[int] = None) -> List[str]:
+    if n is None or n <= 0 or len(text) <= n:
         return [text]
     return [text[i : i + n] for i in range(0, len(text), n)]
 
 # ---------------------------- Construire corpus ----------------------------
-def build_records(root: str) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+def build_records(root: str, cfg: RAGConfig) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """Returnează lista de fragmente (records) + hash-uri per fișier."""
     records: List[Dict[str, Any]] = []
     file_hashes: Dict[str, str] = {}
-    for path in list_files(root):
-        cls = classify(path)
+    for path in list_files(root, cfg):
+        cls = classify(root, path, cfg)
         text = read_text(path)
 
         # meta suplimentare
@@ -153,7 +162,7 @@ def build_records(root: str) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
         file_id = f"{path}"  # grupare pe fișier
 
         # chunking
-        for i, part in enumerate(chunk_text(text)):
+        for i, part in enumerate(chunk_text(text, n=cfg.chunk_size)):
             bm25_text = sanitize_helm_yaml(part) if cls["type"] in ("values", "manifest") else part
             records.append(
                 {
@@ -244,13 +253,13 @@ def have_index(root: str) -> bool:
 
 
 # ---------------------------- Indexare ----------------------------
-def do_index(root: str) -> dict:
+def do_index(root: str, cfg: RAGConfig) -> dict:
     t0 = time.perf_counter()
-    records, file_hashes = build_records(root)
+    records, file_hashes = build_records(root, cfg)
 
     # ---------------- Dense (FAISS) ----------------
     t_dense0 = time.perf_counter()
-    model = SentenceTransformer(MODEL_NAME, device="cpu")
+    model = SentenceTransformer(cfg.model_name, device="cpu")
     texts_dense = [r["text"] for r in records]
     vecs = model.encode(
         texts_dense,
@@ -260,15 +269,15 @@ def do_index(root: str) -> dict:
         show_progress_bar=False,
     )
     dim = vecs.shape[1]
-    index = faiss.IndexHNSWFlat(dim, 32)
-    index.hnsw.efConstruction = 200
+    index = faiss.IndexHNSWFlat(dim, cfg.hnsw_m)
+    index.hnsw.efConstruction = cfg.hnsw_ef
     index.add(vecs.astype(np.float32))
     dense_ms = int((time.perf_counter() - t_dense0) * 1000)
 
     # ---------------- TF-IDF (BM25-like) ----------------
     t_bm0 = time.perf_counter()
     texts_bm25 = [r["bm25_text"] for r in records]
-    vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=1)
+    vectorizer = TfidfVectorizer(ngram_range=cfg.tfidf_ngram, min_df=cfg.tfidf_min_df)
     X = vectorizer.fit_transform(texts_bm25)
     X = normalize(X, norm="l2", copy=False)
     bm25_ms = int((time.perf_counter() - t_bm0) * 1000)
@@ -292,8 +301,8 @@ def do_index(root: str) -> dict:
     # ---------------- Persistă index + cataloage ----------------
     ids = np.arange(len(records))
     snapshot = {
-        "model": MODEL_NAME,
-        "chunk_size": CHUNK_SIZE,
+        "model": cfg.model_name,
+        "chunk_size": cfg.chunk_size,
         "files": file_hashes,
         "created_at": time.time(),
         "counts": {"records": len(records), "files_with_keys": N, "unique_keys": len(key_idf)},
@@ -312,19 +321,21 @@ def do_index(root: str) -> dict:
     }
 
 # ---------------------------- Căutare hibridă ----------------------------
-def reciprocal_rank_fusion(ranks: Dict[int, int], k: int = RRF_K) -> float:
+def reciprocal_rank_fusion(ranks: Dict[int, int], k: int) -> float:
     # scor RRF = sum(1/(k + rank_i))
     return sum(1.0 / (k + r) for r in ranks.values())
 
-def hybrid_search(root: str, query: str, k: int, types: List[str], component: Optional[str], profile: Optional[str], max_per_file: int = 2, weights: Tuple[float,float]=(DENSE_WEIGHT, BM25_WEIGHT)) -> dict:
+def hybrid_search(root: str, query: str, k: int, types: List[str], component: Optional[str], profile: Optional[str], max_per_file: int = 2, weights: Optional[Tuple[float,float]] = None, cfg: Optional[RAGConfig] = None) -> dict:
     fi, ids, tfidf_pack, meta, snapshot = load_index(root)
+    rrf_k = (cfg.rrf_k if cfg else 60)
+    wts = weights or ((cfg.dense_weight, cfg.bm25_weight) if cfg else (0.6, 0.4))
 
     # encode query
     t_dense0 = time.perf_counter()
-    model = SentenceTransformer(snapshot.get("model", MODEL_NAME), device="cpu")
+    model = SentenceTransformer(snapshot.get("model", (cfg.model_name if cfg else "all-MiniLM-L6-v2")), device="cpu")
     q_vec = model.encode([query], convert_to_numpy=True, normalize_embeddings=True)
     # dense topN
-    topN = min(200, len(ids))
+    topN = min((cfg.search_topN if cfg else 200), len(ids))
     D_dense, I_dense = fi.search(q_vec.astype(np.float32), topN)
     dense_ms = int((time.perf_counter() - t_dense0) * 1000)
 
@@ -333,8 +344,7 @@ def hybrid_search(root: str, query: str, k: int, types: List[str], component: Op
     vec = tfidf_pack["vectorizer"].transform([query])
     vec = normalize(vec, norm="l2", copy=False)
     sims = (tfidf_pack["matrix"] @ vec.T).toarray().ravel()  # cosine on L2-normalized tf-idf
-    # ia topM indecși
-    topM = min(200, len(ids))
+    topM = min((cfg.search_topM if cfg else 200), len(ids))
     I_bm = np.argsort(-sims)[:topM]
     bm25_ms = int((time.perf_counter() - t_bm0) * 1000)
 
@@ -350,7 +360,7 @@ def hybrid_search(root: str, query: str, k: int, types: List[str], component: Op
     for idx in cand:
         rd = ranks_dense.get(idx, 10_000)
         rb = ranks_bm.get(idx, 10_000)
-        s = weights[0] * (1.0 / (RRF_K + rd)) + weights[1] * (1.0 / (RRF_K + rb))
+        s = wts[0] * (1.0 / (rrf_k + rd)) + wts[1] * (1.0 / (rrf_k + rb))
         fused_scores[idx] = s
 
     # aplică filtre (types/component/profile)
@@ -480,10 +490,10 @@ except Exception:
 def _render_manifest_stub(mf: dict) -> str:
     """Generează un stub YAML pentru create/suggest (Deployment/Job/etc)."""
     kind = mf.get("kind", "Deployment")
-    name = mf.get("name", "app")
+    name = mf.get("name", os.getenv("RAG_DEFAULT_NAME", "app"))
     p = mf.get("params", {}) or {}
-    image = p.get("image", "nginx:latest")
-    replicas = int(p.get("replicas", 1))
+    image = p.get("image", os.getenv("RAG_DEFAULT_IMAGE", "nginx:latest"))
+    replicas = int(p.get("replicas", os.getenv("RAG_DEFAULT_REPLICAS", 1)))
     with_init = bool(p.get("withInitContainer"))
 
     doc = {
@@ -585,6 +595,114 @@ def _pretty_print_autopatch(payload: dict):
         for c in cmds:
             print(c)
 
+def _parse_env_pairs(s: str) -> List[Dict[str, str]]:
+    items = []
+    if not s:
+        return items
+    for pair in re.split(r"[,\s]+", str(s).strip()):
+        if not pair or "=" not in pair:
+            continue
+        k, v = pair.split("=", 1)
+        if k:
+            items.append({"name": k, "value": v})
+    return items
+
+def _last_intent_value(intents: List[Dict[str, Any]], pred) -> Optional[str]:
+    val = None
+    for it in intents:
+        if it.get("op") == "set" and pred(str(it.get("key","")).lower()):
+            val = str(it.get("value",""))
+    return val
+
+def _build_final_manifest(mf: dict, intents: List[Dict[str, Any]]) -> str:
+    """
+    Synthesize a final K8s manifest from the suggested manifest and intents:
+    - image.repository + image.tag or full 'image'
+    - replicas from replicaCount/replicas
+    - resources.{requests,limits}.{cpu,memory}
+    - env pairs if present in intents (any key containing 'env')
+    """
+    kind = mf.get("kind", "Deployment")
+    name = mf.get("name", os.getenv("RAG_DEFAULT_NAME", "app"))
+    p = (mf.get("params") or {}).copy()
+
+    # extract from intents
+    img_repo = _last_intent_value(intents, lambda k: k.endswith("image.repository"))
+    img_tag  = _last_intent_value(intents, lambda k: k.endswith("image.tag"))
+    img_full = _last_intent_value(intents, lambda k: k.endswith(".image") or k == "image")
+    if img_repo:
+        p["image"] = f"{img_repo}:{img_tag or 'latest'}"
+    elif img_full:
+        p["image"] = img_full
+    image = p.get("image", os.getenv("RAG_DEFAULT_IMAGE", "nginx:latest"))
+
+    rep_from_intents = _last_intent_value(intents, lambda k: k.endswith("replicas") or k.endswith("replicacount"))
+    replicas = int(rep_from_intents) if (rep_from_intents and rep_from_intents.isdigit()) else int(p.get("replicas", os.getenv("RAG_DEFAULT_REPLICAS", 1)))
+
+    req_cpu = _last_intent_value(intents, lambda k: k.endswith("resources.requests.cpu"))
+    lim_cpu = _last_intent_value(intents, lambda k: k.endswith("resources.limits.cpu"))
+    req_mem = _last_intent_value(intents, lambda k: k.endswith("resources.requests.memory"))
+    lim_mem = _last_intent_value(intents, lambda k: k.endswith("resources.limits.memory"))
+
+    env_val = _last_intent_value(intents, lambda k: "env" in k and not k.endswith(".enabled"))
+    env_list = _parse_env_pairs(env_val) if env_val else []
+
+    with_init = bool(p.get("withInitContainer"))
+
+    # base manifest
+    doc = {
+        "apiVersion": "apps/v1" if kind in ("Deployment","StatefulSet","DaemonSet") else "v1",
+        "kind": kind,
+        "metadata": {"name": name},
+        "spec": {}
+    }
+
+    # podspec and containers
+    if kind in ("Deployment","StatefulSet","DaemonSet"):
+        doc["spec"]["replicas"] = replicas
+        podspec = {
+            "containers": [{
+                "name": name,
+                "image": image,
+            }]
+        }
+        if env_list:
+            podspec["containers"][0]["env"] = env_list
+
+        # resources
+        resources = {}
+        if req_cpu or req_mem:
+            resources.setdefault("requests", {})
+            if req_cpu:
+                resources["requests"]["cpu"] = req_cpu
+            if req_mem:
+                resources["requests"]["memory"] = req_mem
+        if lim_cpu or lim_mem:
+            resources.setdefault("limits", {})
+            if lim_cpu:
+                resources["limits"]["cpu"] = lim_cpu
+            if lim_mem:
+                resources["limits"]["memory"] = lim_mem
+        if resources:
+            podspec["containers"][0]["resources"] = resources
+
+        if with_init:
+            podspec["initContainers"] = [{
+                "name": "init",
+                "image": image,
+                "command": ["sh","-c","echo init && sleep 1"]
+            }]
+
+        doc["spec"]["selector"] = {"matchLabels": {"app": name}}
+        doc["spec"]["template"] = {
+            "metadata": {"labels": {"app": name}},
+            "spec": podspec
+        }
+    else:
+        # other kinds can be extended as needed
+        doc["spec"] = {}
+
+    return yaml.safe_dump(doc, sort_keys=False).strip()
 
 # ---------------------------- CLI ----------------------------
 def main():
@@ -598,27 +716,27 @@ def main():
     ap_s = sub.add_parser("search", help="Căutare hibridă (dense+BM25) cu filtre, JSON stabil")
     ap_s.add_argument("--root", required=True)
     ap_s.add_argument("--q", required=True, help="interogare în limbaj natural")
-    ap_s.add_argument("--types", default="values,manifest", help="CSV: values,manifest,config,readme")
+    ap_s.add_argument("--types", default=os.getenv("RAG_DEFAULT_TYPES", "values,manifest"), help="CSV: values,manifest,config,readme")
     ap_s.add_argument("--component", help="filtru pe componentă (subfolder)")
     ap_s.add_argument("--profile", help="filtru pe profil values")
-    ap_s.add_argument("--k", type=int, default=8, help="număr rezultate")
-    ap_s.add_argument("--max-per-file", type=int, default=2, help="max fragmente/fișier în top-k")
-    ap_s.add_argument("--weights", default=f"{DENSE_WEIGHT},{BM25_WEIGHT}", help="ponderi dense,bm25 (ex: 0.6,0.4)")
+    ap_s.add_argument("--k", type=int, default=int(os.getenv("RAG_SEARCH_K", "8")), help="număr rezultate")
+    ap_s.add_argument("--max-per-file", type=int, default=int(os.getenv("RAG_MAX_PER_FILE", "2")), help="max fragmente/fișier în top-k")
+    ap_s.add_argument("--weights", default=os.getenv("RAG_SEARCH_WEIGHTS", ""), help="ponderi dense,bm25 (ex: 0.6,0.4)")
     ap_s.add_argument("--json", action="store_true", help="afișează exact JSON-ul contractului")
 
     ap_p = sub.add_parser("plan", help="Alege componenta țintă și listează values files + chei candidate")
     ap_p.add_argument("--root", required=True)
     ap_p.add_argument("--q", required=True)
-    ap_p.add_argument("--types", default="values,manifest")
-    ap_p.add_argument("--k", type=int, default=8)
+    ap_p.add_argument("--types", default=os.getenv("RAG_DEFAULT_TYPES", "values,manifest"))
+    ap_p.add_argument("--k", type=int, default=int(os.getenv("RAG_PLAN_K", "8")))
     ap_p.add_argument("--json", action="store_true")
 
     ap_patch = sub.add_parser("patch", help="Generează patch-uri YAML rutate pe fișierele values (folosind plan).")
     ap_patch.add_argument("--root", required=True)
     ap_patch.add_argument("--q", default="", help="cerință în limbaj natural (pentru plan/targetare)")
-    ap_patch.add_argument("--types", default="values,manifest", help="pentru plan")
-    ap_patch.add_argument("--k", type=int, default=20, help="pentru plan")
-    ap_patch.add_argument("--out", dest="out_dir", default="out", help="folder output patch-uri")
+    ap_patch.add_argument("--types", default=os.getenv("RAG_DEFAULT_TYPES", "values,manifest"), help="pentru plan")
+    ap_patch.add_argument("--k", type=int, default=int(os.getenv("RAG_PLAN_K", "20")), help="pentru plan")
+    ap_patch.add_argument("--out", dest="out_dir", default=os.getenv("RAG_PATCH_OUT", "out"), help="folder output patch-uri")
     # intenții directe (fără LLM):
     ap_patch.add_argument("--set", dest="sets", action="append", default=[], help="key=value (repetabil)")
     ap_patch.add_argument("--enable", dest="enables", action="append", default=[], help="key (repetabil)")
@@ -629,41 +747,50 @@ def main():
     ap_tr = sub.add_parser("translate", help="NL -> intenții (folosind plan + rule/LLM)")
     ap_tr.add_argument("--root", required=True)
     ap_tr.add_argument("--q", required=True)
-    ap_tr.add_argument("--types", default="values,manifest")
-    ap_tr.add_argument("--k", type=int, default=20)
-    ap_tr.add_argument("--provider", choices=["rule", "llm"], default="rule")
+    ap_tr.add_argument("--types", default=os.getenv("RAG_DEFAULT_TYPES", "values,manifest"))
+    ap_tr.add_argument("--k", type=int, default=int(os.getenv("RAG_TRANSLATE_K", "20")))
+    ap_tr.add_argument("--provider", choices=["rule", "llm"], default=os.getenv("RAG_TRANSLATE_PROVIDER", "rule"))
     ap_tr.add_argument("--allow-new-keys", action="store_true")
     ap_tr.add_argument("--json", action="store_true")
+    ap_tr.add_argument("--show-prompt", action="store_true", help="Print the generated LLM prompt (no call) and exit")
+    # NEW flags to render final YAML
+    ap_tr.add_argument("--render-final", action="store_true", help="Render final manifest YAML from intents + suggestion")
+    ap_tr.add_argument("--yaml-only", action="store_true", help="Print only the YAML when used with --render-final")
 
     # autopatch = plan → translate → patch (într-o singură comandă)
     ap_auto = sub.add_parser("autopatch", help="Plan → Translate → Patch (end-to-end)")
     ap_auto.add_argument("--root", required=True)
     ap_auto.add_argument("--q", required=True)
-    ap_auto.add_argument("--types", default="values,manifest")
-    ap_auto.add_argument("--k", type=int, default=20)
-    ap_auto.add_argument("--provider", choices=["rule", "llm"], default="rule")
+    ap_auto.add_argument("--types", default=os.getenv("RAG_DEFAULT_TYPES", "values,manifest"))
+    ap_auto.add_argument("--k", type=int, default=int(os.getenv("RAG_AUTOPATCH_K", "20")))
+    ap_auto.add_argument("--provider", choices=["rule", "llm"], default=os.getenv("RAG_TRANSLATE_PROVIDER", "rule"))
     ap_auto.add_argument("--allow-new-keys", action="store_true")
-    ap_auto.add_argument("--out", dest="out_dir", default="out")
+    ap_auto.add_argument("--out", dest="out_dir", default=os.getenv("RAG_PATCH_OUT", "out"))
     ap_auto.add_argument("--json", action="store_true")
+    ap_auto.add_argument("--show-prompt", action="store_true", help="Print the generated LLM prompt (no call) and exit")
+    # NEW flags to render final YAML
+    ap_auto.add_argument("--render-final", action="store_true", help="Render final manifest YAML from intents + suggestion")
+    ap_auto.add_argument("--yaml-only", action="store_true", help="Print only the YAML when used with --render-final")
 
     args = ap.parse_args()
+    cfg = RAGConfig.from_root(args.root)
 
     # --- INDEX ---
     if args.cmd == "index":
         if have_index(args.root) and not args.force:
             try:
                 _, _, _, _, snap = load_index(args.root)
-                _, current_hashes = build_records(args.root)
+                _, current_hashes = build_records(args.root, cfg)
                 if (
                     snap.get("files") == current_hashes
-                    and snap.get("model") == MODEL_NAME
-                    and snap.get("chunk_size") == CHUNK_SIZE
+                    and snap.get("model") == cfg.model_name
+                    and snap.get("chunk_size") == cfg.chunk_size
                 ):
                     print("Indexul este deja la zi.")
                     return
             except Exception:
                 pass
-        stats = do_index(args.root)
+        stats = do_index(args.root, cfg)
         print(json.dumps({"status": "ok", "stats": stats}, ensure_ascii=False, indent=2))
         return
 
@@ -672,10 +799,14 @@ def main():
         if not have_index(args.root):
             print("Nu există index. Rulează întâi: python ragctl.py index --root k8s", file=sys.stderr)
             sys.exit(2)
-        types = [t.strip() for t in args.types.split(",") if t.strip()] if args.types else ["values", "manifest"]
-        w = [float(x) for x in args.weights.split(",")] if args.weights else [0.5, 0.5]
+        types = [t.strip() for t in args.types.split(",") if t.strip()] if args.types else [t.strip() for t in cfg.default_types.split(",")]
+        if args.weights:
+            w_parts = [float(x) for x in args.weights.split(",")]
+            w = (w_parts[0], w_parts[1])
+        else:
+            w = cfg.weights_tuple()
         out = hybrid_search(
-            args.root, args.q, args.k, types, args.component, args.profile, args.max_per_file, (w[0], w[1])
+            args.root, args.q, args.k, types, args.component, args.profile, args.max_per_file, w, cfg
         )
         if args.json:
             print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -695,7 +826,7 @@ def main():
             print("Nu există index. Rulează întâi: python ragctl.py index --root k8s", file=sys.stderr)
             sys.exit(2)
 
-        types = [t.strip() for t in args.types.split(",") if t.strip()] if args.types else ["values", "manifest"]
+        types = [t.strip() for t in args.types.split(",") if t.strip()] if args.types else [t.strip() for t in cfg.default_types.split(",")]
 
         out = plan_do(
             root=args.root,
@@ -703,13 +834,14 @@ def main():
             types=types,
             k=args.k,
             have_index_fn=have_index,
-            hybrid_search_fn=hybrid_search,
+            hybrid_search_fn=lambda *a, **kw: hybrid_search(*a, **{**kw, "cfg": cfg}),
             load_index_fn=load_index,
             extract_keys_fn=extract_yaml_keys_from_file,
-            model_name=os.environ.get("RAG_ENCODER", "all-MiniLM-L6-v2"),
+            model_name=cfg.model_name,
             weights={
-                "semantic": float(os.environ.get("PLAN_W_SEM", "0.85")),
-                "search":   float(os.environ.get("PLAN_W_SEARCH", "0.15")),
+                "semantic": cfg.plan_w_sem,
+                "search":   cfg.plan_w_search,
+                "affinity": cfg.plan_w_affinity,
             },
         )
 
@@ -730,7 +862,7 @@ def main():
             print("Nu există index. Rulează întâi: python ragctl.py index --root k8s", file=sys.stderr)
             sys.exit(2)
 
-        types = [t.strip() for t in args.types.split(",") if t.strip()] if args.types else ["values", "manifest"]
+        types = [t.strip() for t in args.types.split(",") if t.strip()] if args.types else [t.strip() for t in cfg.default_types.split(",")]
 
         # 1) PLAN (folosește plan_do)
         plan = plan_do(
@@ -739,13 +871,14 @@ def main():
             types=types,
             k=args.k,
             have_index_fn=have_index,
-            hybrid_search_fn=hybrid_search,
+            hybrid_search_fn=lambda *a, **kw: hybrid_search(*a, **{**kw, "cfg": cfg}),
             load_index_fn=load_index,
             extract_keys_fn=extract_yaml_keys_from_file,
-            model_name=os.environ.get("RAG_ENCODER", "all-MiniLM-L6-v2"),
+            model_name=cfg.model_name,
             weights={
-                "semantic": float(os.environ.get("PLAN_W_SEM", "0.85")),
-                "search":   float(os.environ.get("PLAN_W_SEARCH", "0.15")),
+                "semantic": cfg.plan_w_sem,
+                "search":   cfg.plan_w_search,
+                "affinity": cfg.plan_w_affinity,
             },
         )
 
@@ -799,7 +932,7 @@ def main():
             print("Nu există index. Rulează întâi: python ragctl.py index --root k8s", file=sys.stderr)
             sys.exit(2)
 
-        types = [t.strip() for t in args.types.split(",") if t.strip()] if args.types else ["values", "manifest"]
+        types = [t.strip() for t in args.types.split(",") if t.strip()] if args.types else [t.strip() for t in cfg.default_types.split(",")]
 
         # 1) PLAN
         plan = plan_do(
@@ -808,15 +941,22 @@ def main():
             types=types,
             k=args.k,
             have_index_fn=have_index,
-            hybrid_search_fn=hybrid_search,
+            hybrid_search_fn=lambda *a, **kw: hybrid_search(*a, **{**kw, "cfg": cfg}),
             load_index_fn=load_index,
             extract_keys_fn=extract_yaml_keys_from_file,
-            model_name=os.environ.get("RAG_ENCODER", "all-MiniLM-L6-v2"),
+            model_name=cfg.model_name,
             weights={
-                "semantic": float(os.environ.get("PLAN_W_SEM", "0.85")),
-                "search":   float(os.environ.get("PLAN_W_SEARCH", "0.15")),
+                "semantic": cfg.plan_w_sem,
+                "search":   cfg.plan_w_search,
+                "affinity": cfg.plan_w_affinity,
             },
         )
+
+        # If requested, print the LLM prompt and exit (human-readable)
+        if args.provider == "llm" and getattr(args, "show_prompt", False):
+            prompt = build_llm_prompt(args.q, plan)
+            print(prompt)
+            return
 
         target_comp = (plan.get("target") or {}).get("component")
         if not target_comp:
@@ -825,6 +965,18 @@ def main():
 
         # 2) NL -> intenții
         out = translate_intents(args.q, plan, provider=args.provider, allow_new_keys=args.allow_new_keys)
+
+        # Optionally render final manifest YAML
+        if getattr(args, "render_final", False):
+            mf0 = next((m for m in out.get("manifests", []) if m.get("op") in ("create","suggest")), None)
+            if mf0:
+                final_yaml = _build_final_manifest(mf0, out.get("intents", []))
+                if args.yaml_only:
+                    print(final_yaml)
+                    return
+                else:
+                    print("\nFinal YAML:")
+                    print(final_yaml)
 
         # 3) output
         if args.json:
@@ -840,7 +992,7 @@ def main():
             print("Nu există index. Rulează întâi: python ragctl.py index --root k8s", file=sys.stderr)
             sys.exit(2)
 
-        types = [t.strip() for t in args.types.split(",") if t.strip()] if args.types else ["values", "manifest"]
+        types = [t.strip() for t in args.types.split(",") if t.strip()] if args.types else [t.strip() for t in cfg.default_types.split(",")]
 
         # 1) PLAN
         plan = plan_do(
@@ -849,15 +1001,22 @@ def main():
             types=types,
             k=args.k,
             have_index_fn=have_index,
-            hybrid_search_fn=hybrid_search,
+            hybrid_search_fn=lambda *a, **kw: hybrid_search(*a, **{**kw, "cfg": cfg}),
             load_index_fn=load_index,
             extract_keys_fn=extract_yaml_keys_from_file,
-            model_name=os.environ.get("RAG_ENCODER", "all-MiniLM-L6-v2"),
+            model_name=cfg.model_name,
             weights={
-                "semantic": float(os.environ.get("PLAN_W_SEM", "0.85")),
-                "search":   float(os.environ.get("PLAN_W_SEARCH", "0.15")),
+                "semantic": cfg.plan_w_sem,
+                "search":   cfg.plan_w_search,
+                "affinity": cfg.plan_w_affinity,
             },
         )
+
+        # If requested, print the LLM prompt and exit early
+        if args.provider == "llm" and getattr(args, "show_prompt", False):
+            prompt = build_llm_prompt(args.q, plan)
+            print(prompt)
+            return
 
         target_comp = (plan.get("target") or {}).get("component")
         if not target_comp:
@@ -866,6 +1025,18 @@ def main():
 
         # 2) NL -> intenții
         tr = translate_intents(args.q, plan, provider=args.provider, allow_new_keys=args.allow_new_keys)
+
+        # Optionally render final manifest YAML
+        if getattr(args, "render_final", False):
+            mf0 = next((m for m in tr.get("manifests", []) if m.get("op") in ("create","suggest")), None)
+            if mf0:
+                final_yaml = _build_final_manifest(mf0, tr.get("intents", []))
+                if args.yaml_only:
+                    print(final_yaml)
+                    return
+                else:
+                    print("\nFinal YAML:")
+                    print(final_yaml)
 
         # 3) patch DOAR din intențiile acceptate
         outp = patch_from_plan(plan, tr["intents"], args.out_dir)
