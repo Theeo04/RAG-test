@@ -11,7 +11,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from collections import defaultdict
 
 import numpy as np
-import joblib
+import pickle
 import yaml
 
 from sentence_transformers import SentenceTransformer
@@ -188,7 +188,8 @@ def save_index(root: str, faiss_index, ids: np.ndarray, tfidf_pack: dict,
     d = rag_dir(root)
     faiss.write_index(faiss_index, str(d / "index.faiss"))
     np.save(str(d / "ids.npy"), ids)
-    joblib.dump(tfidf_pack, str(d / "tfidf.pkl"))
+    with open(d / "tfidf.pkl", "wb") as f:
+        pickle.dump(tfidf_pack, f, protocol=pickle.HIGHEST_PROTOCOL)
     with open(d / "meta.jsonl", "w", encoding="utf-8") as f:
         for r in meta:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
@@ -211,11 +212,23 @@ def save_key_catalog(root: str, file_keys: Dict[str, set], key_idf: Dict[str, fl
             df[k] = 0
     write_text(d / "key_stats.json", json.dumps({"N": N, "df": df, "idf": key_idf}, ensure_ascii=False, indent=2))
 
+def _load_tfidf_pack(path):
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception as e:
+        # Dacă indexul vechi a fost salvat cu joblib, oferim mesaj clar
+        raise RuntimeError(
+            "Nu pot încărca tfidf.pkl cu pickle. "
+            "Probabil a fost creat cu joblib. Șterge folderul .rag și reindexează: "
+            "`rm -rf k3s/.rag && python3 ragctl.py index --root k8s`"
+        ) from e
+
 def load_index(root: str):
     d = rag_dir(root)
     fi = faiss.read_index(str(d / "index.faiss"))
     ids = np.load(str(d / "ids.npy"))
-    tfidf_pack = joblib.load(str(d / "tfidf.pkl"))
+    tfidf_pack = _load_tfidf_pack(d / "tfidf.pkl")
     meta: List[Dict[str, Any]] = []
     with open(d / "meta.jsonl", "r", encoding="utf-8") as f:
         for line in f:
@@ -457,6 +470,121 @@ def do_plan(root: str, query: str, types: List[str], k: int) -> dict:
         "top_results": results[:k],
         "stats": out_search.get("stats", {})
     }
+
+import textwrap
+try:
+    import yaml
+except Exception:
+    yaml = None  # fallback fără YAML dacă lipsește pyyaml
+
+def _render_manifest_stub(mf: dict) -> str:
+    """Generează un stub YAML pentru create/suggest (Deployment/Job/etc)."""
+    kind = mf.get("kind", "Deployment")
+    name = mf.get("name", "app")
+    p = mf.get("params", {}) or {}
+    image = p.get("image", "nginx:latest")
+    replicas = int(p.get("replicas", 1))
+    with_init = bool(p.get("withInitContainer"))
+
+    doc = {
+        "apiVersion": "apps/v1" if kind in ("Deployment","StatefulSet","DaemonSet") else "v1",
+        "kind": kind,
+        "metadata": {"name": name},
+        "spec": {}
+    }
+
+    if kind in ("Deployment","StatefulSet","DaemonSet"):
+        doc["spec"]["replicas"] = replicas
+        podspec = {
+            "containers": [{
+                "name": name,
+                "image": image,
+            }]
+        }
+        if with_init:
+            podspec["initContainers"] = [{
+                "name": "init",
+                "image": image,
+                "command": ["sh","-c","echo init && sleep 1"]
+            }]
+        doc["spec"]["selector"] = {"matchLabels": {"app": name}}
+        doc["spec"]["template"] = {
+            "metadata": {"labels": {"app": name}},
+            "spec": podspec
+        }
+    # alte Kinds pot fi adăugate ușor aici (Job, CronJob etc.)
+
+    if yaml:
+        return yaml.safe_dump(doc, sort_keys=False).strip()
+    # fallback fără pyyaml:
+    return textwrap.dedent(f"""\
+      kind: {doc['kind']}
+      apiVersion: {doc['apiVersion']}
+      metadata:
+        name: {name}
+      spec: {{ ... }}
+    """).rstrip()
+
+def _pretty_print_translate(plan: dict, tr: dict):
+    tgt = (plan.get("target") or {}).get("component", "-")
+    print(f"\nComponentă țintă: {tgt} (planner={plan.get('plan_version')})")
+    if tr.get("notes"):
+        print("Note:")
+        for n in tr["notes"][:5]:
+            print(f"  • {n}")
+
+    if tr.get("intents"):
+        print("\nIntenții (values):")
+        for it in tr["intents"]:
+            if it["op"] == "set":
+                print(f"  - set {it['key']} = {it['value']}")
+            else:
+                print(f"  - {it['op']} {it['key']}")
+    if tr.get("rejected"):
+        print("\nRespins (guardrails):")
+        for it in tr["rejected"]:
+            print(f"  - {it.get('key','?')} ({it.get('reason','')})")
+
+    if tr.get("manifests"):
+        print("\nManifeste propuse:")
+        for mf in tr["manifests"]:
+            line = f"  - {mf.get('op','patch')} {mf.get('kind','?')} name={mf.get('name','app')}"
+            reason = mf.get("reason")
+            if reason: line += f" [{reason}]"
+            print(line)
+        # arată un YAML de exemplu pentru primul „create/suggest”
+        mf0 = next((m for m in tr["manifests"] if m.get("op") in ("create","suggest")), None)
+        if mf0:
+            print("\nExemplu YAML:")
+            print(_render_manifest_stub(mf0))
+
+def _pretty_print_autopatch(payload: dict):
+    print(f"\nComponentă: {payload.get('component','-')} (planner={payload.get('plan_version')})")
+    tr = payload.get("translate", {})
+    if tr.get("intents"):
+        print("Intenții acceptate:")
+        for it in tr["intents"]:
+            if it["op"] == "set":
+                print(f"  - set {it['key']} = {it['value']}")
+            else:
+                print(f"  - {it['op']} {it['key']}")
+    if tr.get("rejected"):
+        print("\nRespins (guardrails):")
+        for it in tr["rejected"]:
+            print(f"  - {it.get('key','?')} ({it.get('reason','')})")
+
+    outp = payload.get("patch_result", {})
+    patches = outp.get("patches", [])
+    if patches:
+        print("\nPatch-uri generate:")
+        for p in patches:
+            print(f"  - {p['patch_yaml_path']} -> {p['values_path']} (profile={p.get('profile')})")
+    cmds = outp.get("apply_commands", [])
+    if cmds:
+        print("\nComenzi yq (merge determinist):")
+        for c in cmds:
+            print(c)
+
 
 # ---------------------------- CLI ----------------------------
 def main():
@@ -700,24 +828,11 @@ def main():
 
         # 3) output
         if args.json:
-            print(json.dumps({
-                "plan_version": plan.get("plan_version"),
-                "plan_target": plan.get("target"),
-                "translate": out
-            }, ensure_ascii=False, indent=2))
+            print(json.dumps({"plan_version": plan.get("plan_version"),
+                            "plan_target": plan.get("target"),
+                            "translate": out}, ensure_ascii=False, indent=2))
         else:
-            print(f"Component: {target_comp} (planner={plan.get('plan_version')})")
-            print("Intenții:")
-            for it in out["intents"]:
-                if it["op"] == "set":
-                    print(f" - set {it['key']}={it['value']}")
-                else:
-                    print(f" - {it['op']} {it['key']}")
-            if out["rejected"]:
-                print("\nRespins (nu-s în candidates):")
-                for it in out["rejected"]:
-                    print(f" - {it['key']} ({it.get('reason','')})")
-        return
+            _pretty_print_translate(plan, out)
 
     # --- AUTOPATCH ---
     if args.cmd == "autopatch":
@@ -766,25 +881,7 @@ def main():
         if args.json:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
-            print(f"Component: {payload['component']} (planner={plan.get('plan_version')})")
-            print("Intenții acceptate:")
-            for it in tr["intents"]:
-                if it["op"] == "set":
-                    print(f" - set {it['key']}={it['value']}")
-                else:
-                    print(f" - {it['op']} {it['key']}")
-            if tr["rejected"]:
-                print("\nRespins (nu-s în candidates):")
-                for it in tr["rejected"]:
-                    print(f" - {it['key']} ({it.get('reason','')})")
-            print("\nPatch-uri generate:")
-            for p in outp["patches"]:
-                print(f"- {p['patch_yaml_path']} -> {p['values_path']} (profile={p['profile']})")
-            if outp["apply_commands"]:
-                print("\nComenzi yq:")
-                for c in outp["apply_commands"]:
-                    print(c)
-        return
+            _pretty_print_autopatch(payload)
 
 if __name__ == "__main__":  
     main()

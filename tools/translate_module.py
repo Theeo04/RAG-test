@@ -1,13 +1,17 @@
 # tools/translate_module.py
 # NL -> {intents (values), manifests (k8s)} folosind planul (values_files + manifest_files).
-# Integrare LLM: Ollama (/api/chat). Fallback: reguli generale (fără bias de domeniu).
-# Guardrails: acceptă doar chei din plan (sau allow_new_keys=True). La manifeste, doar Kinds din plan,
-# altfel propune în "suggested_new_kinds".
+# Integrare LLM: Ollama (/api/chat). Fallback: reguli generale, data-driven (fără bias de domeniu).
+# Guardrails: acceptă doar chei din plan (sau allow_new_keys=True). La manifeste, doar Kinds din plan
+# (altfel merg în "suggested_new_kinds").
 
 from __future__ import annotations
 import os, re, json, time
 from typing import List, Dict, Any, Tuple, Set, Optional
 import requests
+
+# data-driven matching (fără liste hardcodate de domeniu)
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import linear_kernel
 
 # ============================= Colectare din plan =============================
 def _collect_from_plan(plan: Dict[str, Any]) -> Tuple[Set[str], Dict[str, str], Set[str]]:
@@ -23,7 +27,7 @@ def _collect_from_plan(plan: Dict[str, Any]) -> Tuple[Set[str], Dict[str, str], 
     for vf in plan.get("values_files", []) or []:
         vpath = vf.get("path")
         for k in vf.get("candidate_keys", []) or []:
-            if not k: 
+            if not k:
                 continue
             keys.add(k)
             key2file.setdefault(k, vpath)
@@ -66,11 +70,9 @@ def _normalize_mem_value(s: str) -> str:
     """
     t = str(s).strip()
     if _MEM_IEC.fullmatch(t):
-        # păstrează unitatea
         return t
     if _NUMBER.fullmatch(t):
         return t
-    # normalizează litere mari/mici pentru IEC (Mi, Gi etc.)
     m = re.match(r"^(\d+)([KMGTE]i)$", t, re.IGNORECASE)
     if m:
         return f"{m.group(1)}{m.group(2)}"
@@ -86,9 +88,8 @@ def _dedup_keep_last(objs: List[Dict[str, Any]], by: Tuple[str, str]=("op","key"
 
 def _maybe_pick_key(candidates: Set[str], hint: str) -> Optional[str]:
     """
-    Caută o cheie plauzibilă din candidates care conține toate token-urile din 'hint'
-    (separate non-alfanumeric). Preferă potriviri mai scurte.
-    Ex: hint='replica count' poate potrivi 'replicaCount' sau 'autoscaling.enabled' etc.
+    Rapid lexical: alege o cheie plauzibilă ce conține toate token-urile din 'hint'.
+    Preferă potriviri mai scurte/stabile.
     """
     toks = [t for t in re.split(r"[^a-z0-9]+", hint.lower()) if t]
     if not toks:
@@ -100,11 +101,61 @@ def _maybe_pick_key(candidates: Set[str], hint: str) -> Optional[str]:
             hits.append(k)
     if not hits:
         return None
-    # preferă cele mai scurte chei
     hits.sort(key=lambda x: (len(x), x))
     return hits[0]
 
-# ============================= Reguli fallback general =============================
+# ============================= Data-driven matching (semantic) =============================
+def _normalize_key_for_text(k: str) -> str:
+    """
+    'global.ingresses.main.tls.certificate' -> 'global ingresses main tls certificate'
+    camelCase -> camel Case; bun pentru n-grame de caractere.
+    """
+    k = re.sub(r"([a-z])([A-Z])", r"\1 \2", k)  # camelCase -> camel Case
+    k = k.replace("_", " ").replace("-", " ").replace(".", " ")
+    k = re.sub(r"\s+", " ", k).strip().lower()
+    return k
+
+def _best_key_semantic(query: str, candidates: Set[str], must_endwith: Optional[str] = None) -> Optional[str]:
+    """
+    Alege cea mai apropiată cheie din 'candidates' față de 'query' pe baza TF-IDF de n-grame de caractere.
+    Dacă 'must_endwith' este dat (ex: '.enabled'), filtrează întâi candidații.
+    """
+    cand_list = sorted(candidates)
+    if must_endwith:
+        cand_list = [k for k in cand_list if k.endswith(must_endwith)]
+    if not cand_list:
+        return None
+
+    corpus = [_normalize_key_for_text(k) for k in cand_list]
+    q_txt  = _normalize_key_for_text(query)
+
+    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3,5), min_df=1)
+    X = vec.fit_transform(corpus + [q_txt])  # [N + 1, D]
+    sims = linear_kernel(X[-1], X[:-1]).ravel()  # cos similarity
+    idx = int(sims.argmax())
+    return cand_list[idx]
+
+def _polarity_from_query(query_lc: str) -> Optional[int]:
+    """
+    +1 = ON/ENABLE, -1 = OFF/DISABLE, None = necunoscut.
+    Cuvintele vin din ENV (customizabile fără cod):
+      RAG_BOOL_ON="enable,on,true,activate,start,up,yes,activeaza,porni,pornește"
+      RAG_BOOL_OFF="disable,off,false,deactivate,stop,down,no,dezactiveaza,opreste,opri"
+    """
+    on_words  = set(os.getenv("RAG_BOOL_ON",  "enable,on,true,activate,start,up,yes,activeaza,porni,pornește").lower().split(","))
+    off_words = set(os.getenv("RAG_BOOL_OFF", "disable,off,false,deactivate,stop,down,no,dezactiveaza,opreste,opri").lower().split(","))
+    tokens = set(t for t in re.split(r"[^a-z0-9]+", query_lc) if t)
+    if tokens & on_words:
+        return +1
+    if tokens & off_words:
+        return -1
+    return None
+
+# ============================= Reguli fallback general (data-driven) =============================
+_IMG_RE = re.compile(r'\b([a-z0-9][a-z0-9\-_.\/]*):(\d[\w.\-]*)\b', re.IGNORECASE)   # nginx:1.29.1
+_ENV_PAIR_RE = re.compile(r'\b([A-Z0-9_]{2,})\s*=\s*([^\s,;]+)')  # FOO=bar
+_HOST_RE = re.compile(r'\b([a-z0-9.-]+\.[a-z]{2,})\b', re.IGNORECASE)
+
 def _rule_based(query: str,
                 candidates: Set[str],
                 allowed_kinds: Set[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
@@ -113,7 +164,7 @@ def _rule_based(query: str,
       - intents (values)
       - manifests (scaffold/sugestii)
       - notes
-    Fără bias de domeniu — inferă din limbajul natural patternuri uzuale.
+    Fără cuvinte-cheie de domeniu; se bazează pe patternuri uzuale și potrivire data-driven.
     """
     q = query.strip()
     ql = q.lower()
@@ -121,27 +172,24 @@ def _rule_based(query: str,
     manifests: List[Dict[str, Any]] = []
     notes: List[str] = []
 
-    # --- Detectează cereri de tip "creează/creare deployment ... cu initContainer ..."
-    # indicii: "creeaza|creați|create|add" + "deployment|statefulset|daemonset|job|cronjob"
+    # --- Detectare "create <workload>" generic ---
+    creating = any(w in ql for w in ["creeaza", "creaza", "creați", "create", "adauga", "adaugă", "add", "genereaza", "generează"])
     kind_word = None
     for kw in ["deployment", "statefulset", "daemonset", "job", "cronjob"]:
         if re.search(rf"\b{kw}\b", ql):
             kind_word = kw.capitalize() if kw != "cronjob" else "CronJob"
             break
+    target_kind = kind_word or ("Deployment" if creating else "")
 
     name_match = re.search(r"\b(?:named|nume|name)\s*[:=]?\s*([a-z0-9-_.]+)", ql)
     image_match = re.search(r"\bimage\s*[:=]\s*([a-z0-9./:_-]+)", q, flags=re.IGNORECASE)
     init_hint = ("initcontainer" in ql) or ("init container" in ql) or ("init-cont" in ql)
 
-    # dacă utilizatorul a spus explicit „nginx” fără image, îl interpretăm ca nume sau imagine
+    # fallback semantic: dacă se menționează „nginx” dar nu există image, presupunem nginx:latest
     if "nginx" in ql and not image_match:
         image_match = re.search(r"(nginx)(?::([a-z0-9._-]+))?", "nginx:latest", flags=re.IGNORECASE)
 
-    # Dacă avem o cerere de creare + (kind sau implicit Deployment), construim manifest-suggestion
-    creating = any(w in ql for w in ["creeaza", "creaza", "creați", "create", "adauga", "adaugă", "add", "genereaza", "generează"])
-    if creating:
-        target_kind = kind_word or "Deployment"
-        # guardrail: dacă kindul nu există în componentă, îl marcăm drept suggested_new_kinds
+    if creating and target_kind:
         if allowed_kinds and target_kind not in allowed_kinds:
             notes.append(f"kind '{target_kind}' nu există în componentă; marcat ca suggested_new_kinds")
             manifests.append({
@@ -167,18 +215,17 @@ def _rule_based(query: str,
                 }
             })
 
-    # --- Replicas
+    # --- Replicas (generic) ---
     m_rep = re.search(r"\breplicas?\s*(?:=|:)?\s*(\d+)\b", ql)
     if m_rep:
         val = m_rep.group(1)
-        # caută o cheie de tip replica count în candidates
-        prefer = _maybe_pick_key(candidates, "replica count")
+        prefer = _maybe_pick_key(candidates, "replica count") or _maybe_pick_key(candidates, "replicas")
         for cand in [prefer, "replicaCount", "replicas"]:
             if cand and cand in candidates:
                 intents.append({"op": "set", "key": cand, "value": val})
                 break
 
-    # --- CPU
+    # --- CPU (generic) ---
     if "cpu" in ql:
         m_cpu = re.search(r"\bcpu[^0-9a-zA-Z]{0,3}(\d+m|\d+(?:\.\d+)?)", ql)
         if not m_cpu:
@@ -189,7 +236,7 @@ def _rule_based(query: str,
                 if cand in candidates:
                     intents.append({"op": "set", "key": cand, "value": cpu_val})
 
-    # --- Memory
+    # --- Memory (generic) ---
     if "mem" in ql or "memory" in ql:
         m_mem = re.search(r"\b(\d+(?:Ki|Mi|Gi|Ti|Pi|Ei))\b", q)
         if not m_mem:
@@ -200,46 +247,50 @@ def _rule_based(query: str,
                 if cand in candidates:
                     intents.append({"op": "set", "key": cand, "value": mem_val})
 
-    # --- Image (dacă avem chei de tip image.repository / image.tag)
-    m_img = image_match
+    # --- Image repo:tag (generic) ---
+    m_img = image_match or _IMG_RE.search(q)
     if m_img:
         full = m_img.group(0)
         repo, tag = (full, None)
         if ":" in full:
             repo, tag = full.split(":", 1)
-        key_repo = _maybe_pick_key(candidates, "image repository")
-        key_tag  = _maybe_pick_key(candidates, "image tag")
+        key_repo = _maybe_pick_key(candidates, "image repository") or _maybe_pick_key(candidates, "image")
+        key_tag  = _maybe_pick_key(candidates, "image tag") or _maybe_pick_key(candidates, "tag")
         if key_repo and key_repo in candidates:
             intents.append({"op": "set", "key": key_repo, "value": repo})
         if tag and key_tag and key_tag in candidates:
             intents.append({"op": "set", "key": key_tag, "value": tag})
 
-    # --- Enable/disable generic (potrivește *.enabled care seamănă cu cererea)
-    # ex: "activeaza readiness probe" -> caută ceva cu "readiness.*enabled"
-    if any(w in ql for w in ["activeaza", "activati", "activează", "enable", "porneste", "pornește", "start"]):
-        # încearcă să captureze un token țintă
-        after = re.split(r"(activeaza|activati|activează|enable|porneste|pornește|start)", ql, maxsplit=1)
-        target_hint = after[-1] if after else ""
-        cand = None
-        # întâi caută hint.*enabled
-        cand = _maybe_pick_key(candidates, f"{target_hint} enabled")
-        if not cand:
-            # fallback: exact '...enabled'
-            for k in sorted(candidates):
-                if k.lower().endswith(".enabled"):
-                    cand = k; break
-        if cand and cand in candidates:
-            intents.append({"op": "enable", "key": cand})
+    # --- Env pairs (generic) ---
+    env_pairs = list(_ENV_PAIR_RE.findall(q))
+    if env_pairs:
+        env_key = _maybe_pick_key(candidates, "env") or _maybe_pick_key(candidates, "environment")
+        if env_key and env_key in candidates:
+            val = ",".join([f"{k}={v}" for k, v in env_pairs])
+            intents.append({"op": "set", "key": env_key, "value": val})
 
-    if any(w in ql for w in ["dezactiveaza", "dezactivați", "disable", "opreste", "opriți", "stop"]):
-        after = re.split(r"(dezactiveaza|dezactivați|disable|opreste|opriți|stop)", ql, maxsplit=1)
-        target_hint = after[-1] if after else ""
-        cand = _maybe_pick_key(candidates, f"{target_hint} enabled")
-        if cand and cand in candidates:
-            intents.append({"op": "disable", "key": cand})
+    # --- Ingress host (generic) ---
+    if any(w in ql for w in ["ingress", "host", "hostname"]):
+        hm = _HOST_RE.search(q)
+        if hm:
+            host = hm.group(1)
+            host_key = _maybe_pick_key(candidates, "hosts") or _maybe_pick_key(candidates, "ingress hosts")
+            if host_key and host_key in candidates:
+                intents.append({"op": "set", "key": host_key, "value": host})
+
+    # --- Enable/Disable generic (DATA-DRIVEN) ---
+    pol = _polarity_from_query(ql)
+    if pol is not None:
+        best_enabled = _best_key_semantic(q, candidates, must_endwith=".enabled")
+        if best_enabled:
+            intents.append({
+                "op": "enable" if pol > 0 else "disable",
+                "key": best_enabled
+            })
 
     intents = _dedup_keep_last(intents)
     manifests = _dedup_keep_last(manifests, by=("op","kind"))
+    notes.append("generic fallback applied (data-driven; no domain-specific keywords)")
 
     return intents, manifests, notes
 
@@ -289,9 +340,9 @@ def _call_ollama(prompt: str) -> str:
 
 def _llm_prompt(query: str, candidates: Set[str], allowed_kinds: Set[str]) -> str:
     """
-    Prompt compact, strict JSON, fără bias. Modelele mici răspund stabil.
+    Prompt compact, strict JSON, fără bias, fără cuvinte-cheie hardcodate.
     """
-    allowed_keys_list = sorted(list(candidates))[:300]  # nu supraîncărcăm promptul
+    allowed_keys_list = sorted(list(candidates))[:300]
     allowed_kinds_list = sorted(list(allowed_kinds)) if allowed_kinds else []
 
     lines = [
@@ -302,14 +353,13 @@ def _llm_prompt(query: str, candidates: Set[str], allowed_kinds: Set[str]) -> st
         '  "manifests": [ {"op":"create|patch|suggest","kind":"<ALLOWED_KIND>","name":string,"params":object} ],',
         '  "notes": []',
         "}",
-        "Rules:",
         f"- Keys must be chosen ONLY from this allow-list: {allowed_keys_list}",
     ]
 
     if allowed_kinds_list:
         lines.append(f"- Kinds must be chosen ONLY from this allow-list: {allowed_kinds_list}")
     else:
-        lines.append("- If you propose a new kind that is not in allow-list, use op='suggest' and include a minimal 'params'.")
+        lines.append("- If you propose a new kind not in allow-list, use op='suggest' with minimal params.")
 
     lines += [
         "- If CPU or memory is mentioned, set both requests and limits when possible.",
@@ -335,14 +385,13 @@ def translate_intents(query: str,
       "notes":     [ ... ],
       "key_hint":  { key -> values_path },
       "allowed_kinds": [ ... ],
-      "suggested_new_kinds": [ ... ]   # dacă apar create/suggest pe Kinds neobservate în componentă
+      "suggested_new_kinds": [ ... ]
     }
     """
     candidates, key2file, allowed_kinds = _collect_from_plan(plan)
     notes: List[str] = [f"{len(candidates)} candidate keys from plan",
                         f"{len(allowed_kinds)} allowed kinds from manifests"]
 
-    # --- produce intenții/manifeste brute ---
     intents_raw: List[Dict[str, Any]] = []
     manifests_raw: List[Dict[str, Any]] = []
 
@@ -418,7 +467,6 @@ def translate_intents(query: str,
             continue
 
         if allowed_kinds and kind not in allowed_kinds:
-            # dacă nu e în allow-list, marchez sugestie
             suggested_new_kinds.add(kind)
             manifests.append({
                 "op": "suggest",
@@ -430,7 +478,7 @@ def translate_intents(query: str,
             continue
 
         if op not in ("create","patch","suggest"):
-            op = "patch"  # default sigur
+            op = "patch"
 
         manifests.append({"op": op, "kind": kind, "name": name, "params": params})
 
