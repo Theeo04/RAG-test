@@ -1,5 +1,4 @@
-# RAG-IONOS-hackathon
-
+# RAG-test
 ## 1. Setup venv
 
 ```
