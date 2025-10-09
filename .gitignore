@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+dist/
+build/
+.next/
+.DS_Store
+.idea/
+.vscode/
+out/
+.rag/
+*.log
