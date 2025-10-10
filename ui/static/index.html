@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>K8s RAG UI</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 16px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .col { flex: 1 1 320px; min-width: 300px; }
+    input, select, textarea, button { padding: 6px; margin: 4px 0; width: 100%; box-sizing: border-box; }
+    pre { background: #f7f7f7; padding: 10px; border: 1px solid #ddd; white-space: pre-wrap; word-break: break-word; }
+    .panel { border: 1px solid #ccc; padding: 10px; margin-top: 10px; border-radius: 6px; }
+    .actions { display: flex; gap: 8px; }
+    .badge { display: inline-block; padding: 2px 6px; background: #eee; border-radius: 4px; margin-right: 6px; }
+    /* Busy overlay */
+    #busy {
+      position: fixed; inset: 0; display: none; z-index: 9999;
+      background: rgba(255,255,255,0.75);
+      align-items: center; justify-content: center; flex-direction: column;
+      color: #222; font-weight: 500;
+    }
+    #busy .spinner {
+      width: 36px; height: 36px; border: 4px solid #ccc; border-top-color: #333;
+      border-radius: 50%; margin-bottom: 10px; animation: spin 1s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <h2>Kubernetes RAG UI</h2>
+  <div class="row">
+    <div class="col panel">
+      <h3>Settings</h3>
+      <label>Repo root <input id="root" value=".." /></label>
+      <label>k8s folder <input id="k8s" value="k8s" /></label>
+      <label>Embedding model <input id="embedModel" value="all-MiniLM-L6-v2" /></label>
+      <label>LLM model <input id="llmModel" value="llama3.1:latest" /></label>
+      <label>Types (comma) <input id="types" value="values,manifest" /></label>
+      <label>Top results (k) <input id="k" type="number" value="12" /></label>
+      <label>Top components <input id="topComponents" type="number" value="1" /></label>
+      <label>Min score (optional) <input id="minScore" placeholder="e.g. 0.5" /></label>
+      <div class="actions">
+        <button id="btnIndex">Build index</button>
+      </div>
+    </div>
+    <div class="col panel">
+      <h3>Question</h3>
+      <textarea id="query" rows="6" placeholder='Increase CPU for api to 200m and set replicas to 3'></textarea>
+      <div class="actions">
+        <button id="btnAsk">Ask</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Plan summary</h3>
+    <div id="planTargets"></div>
+    <div id="planComponents"></div>
+    <div id="planValues"></div>
+    <div id="planTop"></div>
+    <div id="signals"></div>
+  </div>
+
+  <div class="panel">
+    <h3>LLM</h3>
+    <div id="llmStatus"></div>
+    <pre id="answer"></pre>
+  </div>
+
+  <div class="panel">
+    <h3>Detected intents</h3>
+    <pre id="intents"></pre>
+  </div>
+
+  <div class="panel">
+    <h3>Final YAML (copy & paste)</h3>
+    <button id="copyYaml">Copy YAML</button>
+    <pre id="finalYaml"></pre>
+    <div id="patchDir"></div>
+  </div>
+
+  <!-- Busy overlay -->
+  <div id="busy">
+    <div class="spinner"></div>
+    <div id="busyMsg">Working... please wait</div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
