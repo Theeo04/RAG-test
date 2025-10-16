@@ -108,6 +108,26 @@ def _ollama_http(endpoint: str, payload: Dict, timeout: Tuple[float, float], ver
         print(f"[gen] ollama: all endpoints failed (tried {', '.join(tried)})")
     return None
 
+# NEW: warm-up helper to load the model with a 1-token generate
+def _ollama_warmup(model: str, verbose: bool = False) -> None:
+    try:
+        opts = _ollama_options()
+        opts["num_predict"] = 1
+        payload = {
+            "model": model,
+            "prompt": "ok",
+            "stream": False,
+            "options": opts,
+            "keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "30m"),
+        }
+        # allow longer warm-up read timeout for model load
+        t_connect = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "0.2"))
+        t_read = float(os.getenv("OLLAMA_WARMUP_TIMEOUT", "180"))
+        _ = _ollama_http("/api/generate", payload, (t_connect, t_read), verbose=verbose, kind="generate")
+    except Exception as e:
+        if verbose:
+            print(f"[gen] warmup error (ignored): {e}")
+
 def _detect_allowed_keys(requirement: str) -> Dict[str, any]:
     """
     Tighter heuristics: pick nginx image correctly; prefer readiness=/ready and metrics=/metrics;
@@ -445,8 +465,9 @@ def _ollama_generate(prompt: str, ctx: str, verbose: bool = False) -> str | None
     mode = _ollama_mode()
     model = _ollama_model()
     opts = _ollama_options(temperature=0.2)
+    # CHANGED: increase default read timeout to tolerate cold-start loads
     t_connect = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "0.2"))
-    t_read = float(os.getenv("OLLAMA_READ_TIMEOUT", "20"))
+    t_read = float(os.getenv("OLLAMA_READ_TIMEOUT", "120"))
     timeout = (t_connect, t_read)
 
     def call_chat() -> str | None:
@@ -485,15 +506,27 @@ def _ollama_generate(prompt: str, ctx: str, verbose: bool = False) -> str | None
                 return txt
         return None
 
-    if mode == "chat":
-        return call_chat()
-    if mode == "generate":
-        return call_generate()
-    # auto: try chat then generate
-    out = call_chat()
+    def try_once() -> str | None:
+        if mode == "chat":
+            return call_chat()
+        if mode == "generate":
+            return call_generate()
+        out = call_chat()
+        return out or call_generate()
+
+    # First attempt (fast path)
+    out = try_once()
     if out:
         return out
-    return call_generate()
+
+    # Warm-up and retry once if first attempt failed (likely cold start)
+    if os.getenv("OLLAMA_WARMUP_ON_FAIL", "1").lower() not in ("0", "false", "no"):
+        if verbose:
+            print("[gen] ollama: warming up model and retrying once...")
+        _ollama_warmup(model, verbose=verbose)
+        return try_once()
+
+    return None
 
 def _minimal_template(req_info: Dict, paths: Dict[str, str]) -> str:
     allowed = req_info.get("allowed", set())
