@@ -2,10 +2,11 @@ import os
 import re
 from typing import Dict, List, Tuple
 import yaml  # NEW
-from .llm.ollama_client import OllamaClient  # NEW
+# from .llm.ollama_client import OllamaClient  # REMOVED
 from .context import compose_context  # NEW
 import time  # NEW
 import requests  # NEW
+from requests.adapters import HTTPAdapter  # NEW
 
 GEN_SYS_PROMPT = """You are a Kubernetes Helm values/common.yaml generator.
 - Follow the schema and conventions from the provided context.
@@ -31,6 +32,48 @@ def _ollama_mode() -> str:  # NEW
     Controls which Ollama API to use: chat | generate | auto (try chat, then generate).
     """
     return os.getenv("OLLAMA_MODE", "auto").lower()
+
+# NEW: fast local Ollama helpers
+def _ollama_base_url() -> str:
+    return os.getenv("OLLAMA_HOST", os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
+
+def _ollama_model() -> str:
+    # Keep configurable; default to a common, reasonably fast model
+    return os.getenv("OLLAMA_MODEL", "llama3.1")
+
+def _ollama_options(temperature: float = 0.2) -> Dict:
+    # Speed-leaning defaults; override via env if needed
+    return {
+        "temperature": float(os.getenv("OLLAMA_TEMPERATURE", str(temperature))),
+        "top_p": float(os.getenv("OLLAMA_TOP_P", "0.9")),
+        "top_k": int(os.getenv("OLLAMA_TOP_K", "20")),
+        "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "2048")),
+        "num_predict": int(os.getenv("OLLAMA_NUM_PREDICT", "512")),
+    }
+
+_SESSION = None  # type: requests.Session | None
+
+def _get_session() -> requests.Session:
+    global _SESSION
+    if _SESSION is None:
+        s = requests.Session()
+        # Small but sufficient connection pool for local calls
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=0)
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+        _SESSION = s
+    return _SESSION
+
+def _ollama_http(endpoint: str, payload: Dict, timeout: Tuple[float, float], verbose: bool = False) -> Dict | None:
+    url = f"{_ollama_base_url()}{endpoint}"
+    try:
+        resp = _get_session().post(url, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.RequestException as e:
+        if verbose:
+            print(f"[gen] ollama http error: {e}")
+        return None
 
 def _detect_allowed_keys(requirement: str) -> Dict[str, any]:
     """
@@ -408,12 +451,55 @@ def _dump_yaml(doc: Dict) -> str:  # NEW
 
 def _ollama_generate(prompt: str, ctx: str, verbose: bool = False) -> str | None:  # CHANGED
     """
-    Use shared OllamaClient (short connect/read timeouts, preflight, retries).
+    Call local Ollama HTTP API directly (fast path) with small timeouts and no streaming.
+    Respects OLLAMA_MODE=(chat|generate|auto) and OLLAMA_MODEL.
     """
-    client = OllamaClient()
-    prefer = os.getenv("OLLAMA_MODE", "generate").lower()
-    verbose_flag = bool(verbose) or os.getenv("RAG_DEBUG") == "1" or os.getenv("GEN_VERBOSE") == "1"
-    return client.complete(GEN_SYS_PROMPT, prompt, prefer=prefer, temperature=0.2, verbose=verbose_flag)
+    mode = _ollama_mode()
+    model = _ollama_model()
+    opts = _ollama_options(temperature=0.2)
+    # Very small local timeouts: connect=0.5s, read=60s (tunable via env)
+    t_connect = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "0.5"))
+    t_read = float(os.getenv("OLLAMA_READ_TIMEOUT", "60"))
+    timeout = (t_connect, t_read)
+
+    def call_chat() -> str | None:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": GEN_SYS_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "options": opts,
+            "keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "2m"),
+        }
+        data = _ollama_http("/api/chat", payload, timeout, verbose=verbose)
+        if data and "message" in data and isinstance(data["message"], dict):
+            return data["message"].get("content")
+        return None
+
+    def call_generate() -> str | None:
+        payload = {
+            "model": model,
+            "prompt": f"{GEN_SYS_PROMPT}\n\n{prompt}",
+            "stream": False,
+            "options": opts,
+            "keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "2m"),
+        }
+        data = _ollama_http("/api/generate", payload, timeout, verbose=verbose)
+        if data and "response" in data:
+            return data["response"]
+        return None
+
+    if mode == "chat":
+        return call_chat()
+    if mode == "generate":
+        return call_generate()
+    # auto: try chat then generate
+    out = call_chat()
+    if out:
+        return out
+    return call_generate()
 
 def _minimal_template(req_info: Dict, paths: Dict[str, str]) -> str:  # NEW
     """
@@ -508,8 +594,8 @@ def generate_yaml(requirement: str,
         print(f"[gen] prompt size: {len(llm_prompt)} chars, {lines} lines")
 
     # Robust retry with backoff and timing logs
-    max_retries = max(1, int(os.getenv("OLLAMA_MAX_RETRIES", "3")))  # NEW
-    delay = 1.0  # seconds
+    max_retries = max(1, int(os.getenv("OLLAMA_MAX_RETRIES", "2")))  # CHANGED default 2
+    delay = 0.25  # CHANGED: faster initial backoff
     out = None
     for attempt in range(1, max_retries + 1):
         t0 = time.monotonic()
