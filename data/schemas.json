@@ -1,0 +1,94 @@
+{
+  "/home/ggheorghe/Desktop/hack-ok-version/hack-llm-repo/k8s/apache-benchmark-latency-test/values/common.yaml": {
+    "image": [
+      "repository",
+      "tag"
+    ],
+    "mam": [
+      "dc",
+      "stage",
+      "brand"
+    ],
+    "global": [
+      "app"
+    ],
+    "pdb": [
+      "enabled"
+    ],
+    "commandOverride": [],
+    "extraArgs": [],
+    "replicaCount": []
+  },
+  "/home/ggheorghe/Desktop/hack-ok-version/hack-llm-repo/k8s/nginx-latency-test/values/common.yaml": {
+    "image": [
+      "repository",
+      "tag"
+    ],
+    "sidecars": [
+      "nginxlogexporter"
+    ],
+    "mam": [
+      "dc",
+      "stage",
+      "brand"
+    ],
+    "global": [
+      "app"
+    ],
+    "volumes": [
+      "cache",
+      "html-index",
+      "work",
+      "nginx-logs"
+    ],
+    "initContainers": [
+      "init"
+    ],
+    "pdb": [
+      "enabled"
+    ],
+    "configMaps": [
+      "nginxlogexporter",
+      "factscript",
+      "enable-latency",
+      "available-latency",
+      "nginx-conf"
+    ]
+  },
+  "/home/ggheorghe/Desktop/hack-ok-version/hack-llm-repo/k8s/webtest/values/common.yaml": {
+    "image": [
+      "repository",
+      "tag"
+    ],
+    "mam": [
+      "dc",
+      "stage",
+      "brand"
+    ],
+    "global": [
+      "app",
+      "ingresses"
+    ],
+    "probes": [
+      "readiness"
+    ],
+    "secrets": [
+      "tls"
+    ],
+    "pdb": [
+      "enabled"
+    ],
+    "configMaps": [
+      "local",
+      "dump",
+      "rc",
+      "site-config",
+      "envvars",
+      "casauth"
+    ],
+    "resources": [
+      "requests",
+      "limits"
+    ]
+  }
+}
