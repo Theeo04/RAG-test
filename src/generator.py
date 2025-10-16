@@ -1,12 +1,11 @@
 import os
 import re
+import time
 from typing import Dict, List, Tuple
-import yaml  # NEW
-# from .llm.ollama_client import OllamaClient  # REMOVED
-from .context import compose_context  # NEW
-import time  # NEW
-import requests  # NEW
-from requests.adapters import HTTPAdapter  # NEW
+import requests
+from requests.adapters import HTTPAdapter
+import yaml
+from .context import compose_context
 
 GEN_SYS_PROMPT = """You are a Kubernetes Helm values/common.yaml generator.
 - Follow the schema and conventions from the provided context.
@@ -27,28 +26,26 @@ def _format_context(retrieved: List[Tuple[float, Dict, str]], schema_summary: Di
             parts.append(f"# {top}: {ck}")
     return "\n".join(parts)
 
-def _ollama_mode() -> str:  # NEW
-    """
-    Controls which Ollama API to use: chat | generate | auto (try chat, then generate).
-    """
-    return os.getenv("OLLAMA_MODE", "auto").lower()
+def _ollama_mode() -> str:
+    # Default to generate (lower overhead than chat)
+    return os.getenv("OLLAMA_MODE", "generate").lower()
 
-# NEW: fast local Ollama helpers
 def _ollama_base_url() -> str:
     return os.getenv("OLLAMA_HOST", os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
 
 def _ollama_model() -> str:
-    # Keep configurable; default to a common, reasonably fast model
-    return os.getenv("OLLAMA_MODEL", "llama3.1")
+    # Fast local default; override with OLLAMA_MODEL
+    return os.getenv("OLLAMA_MODEL", "llama3.1:8b-instruct-q4_K_M")
 
 def _ollama_options(temperature: float = 0.2) -> Dict:
-    # Speed-leaning defaults; override via env if needed
+    # Speed-leaning defaults; all overridable via env
     return {
         "temperature": float(os.getenv("OLLAMA_TEMPERATURE", str(temperature))),
-        "top_p": float(os.getenv("OLLAMA_TOP_P", "0.9")),
+        "top_p": float(os.getenv("OLLAMA_TOP_P", "0.8")),
         "top_k": int(os.getenv("OLLAMA_TOP_K", "20")),
-        "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "2048")),
-        "num_predict": int(os.getenv("OLLAMA_NUM_PREDICT", "512")),
+        "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "1536")),
+        "num_predict": int(os.getenv("OLLAMA_NUM_PREDICT", "256")),
+        "seed": int(os.getenv("OLLAMA_SEED", "-1")),  # -1=random
     }
 
 _SESSION = None  # type: requests.Session | None
@@ -57,23 +54,59 @@ def _get_session() -> requests.Session:
     global _SESSION
     if _SESSION is None:
         s = requests.Session()
-        # Small but sufficient connection pool for local calls
         adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=0)
         s.mount("http://", adapter)
         s.mount("https://", adapter)
         _SESSION = s
     return _SESSION
 
-def _ollama_http(endpoint: str, payload: Dict, timeout: Tuple[float, float], verbose: bool = False) -> Dict | None:
-    url = f"{_ollama_base_url()}{endpoint}"
-    try:
-        resp = _get_session().post(url, json=payload, timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.exceptions.RequestException as e:
-        if verbose:
-            print(f"[gen] ollama http error: {e}")
-        return None
+def _ollama_http(endpoint: str, payload: Dict, timeout: Tuple[float, float], verbose: bool = False, kind: str | None = None) -> Dict | None:
+    base = _ollama_base_url()
+
+    def endpoints() -> List[str]:
+        eps: List[str] = []
+        if endpoint:
+            eps.append(endpoint)
+        if kind == "chat":
+            eps += ["/api/chat", "/v1/chat/completions"]
+        elif kind == "generate":
+            eps += ["/api/generate", "/generate", "/v1/completions"]
+        # de-dup while preserving order
+        seen, out = set(), []
+        for e in eps:
+            if e not in seen:
+                out.append(e)
+                seen.add(e)
+        return out
+
+    tried: List[str] = []
+    for ep in endpoints():
+        tried.append(ep)
+        url = f"{base}{ep if ep.startswith('/') else '/' + ep}"
+        try:
+            resp = _get_session().post(url, json=payload, timeout=timeout)
+            if resp.status_code == 404:
+                if verbose:
+                    print(f"[gen] ollama 404 at {url}, trying fallback...")
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as e:
+            sc = getattr(e.response, "status_code", None) if getattr(e, "response", None) is not None else None
+            if sc == 404:
+                if verbose:
+                    print(f"[gen] ollama 404 at {url}, trying fallback...")
+                continue
+            if verbose:
+                print(f"[gen] ollama http error: {e}")
+            return None
+        except requests.exceptions.RequestException as e:
+            if verbose:
+                print(f"[gen] ollama http error: {e}")
+            return None
+    if verbose:
+        print(f"[gen] ollama: all endpoints failed (tried {', '.join(tried)})")
+    return None
 
 def _detect_allowed_keys(requirement: str) -> Dict[str, any]:
     """
@@ -83,17 +116,16 @@ def _detect_allowed_keys(requirement: str) -> Dict[str, any]:
     txt = requirement.lower()
     allowed = set()
 
-    # metrics
+    # metrics (prefer explicit /metrics, avoid *.conf)
     metrics = None
     if "metrics" in txt or "monitoring" in txt:
         path = None
-        m1 = re.search(r'metrics[^/\n\r]*?(?:path|at)\s*(/[-/a-z0-9._]+)', requirement, re.IGNORECASE)
-        if m1:
-            path = m1.group(1)
-        if not path:
-            m2 = re.search(r'/(metrics[^\s,;]*)', requirement, re.IGNORECASE)
-            if m2:
-                path = "/" + m2.group(1).lstrip("/")
+        m_explicit = re.search(r'(?<![A-Za-z0-9._/-])/(metrics(?:/[A-Za-z0-9._-]+)*)\b', requirement, re.IGNORECASE)
+        m_hint = re.search(r'metrics[^/.,\n\r]*?(?:path|at)\s*(/[-/a-z0-9._]+)', requirement, re.IGNORECASE)
+        if m_explicit:
+            path = "/" + m_explicit.group(1).lstrip("/")
+        elif m_hint:
+            path = m_hint.group(1)
         port = None
         mport = re.search(r'(?:on\s+)?port\s+(\d+)', requirement, re.IGNORECASE)
         if mport:
@@ -133,7 +165,6 @@ def _detect_allowed_keys(requirement: str) -> Dict[str, any]:
         m = re.search(r'image(?:\s+|:)\s*([a-z0-9/_\-.]+)(?::([a-z0-9._\-]+))?', requirement, re.IGNORECASE)
         cand = m.group(1) if m else None
         tag = m.group(2) if m else None
-        # accept only plausible image identifiers; else fall back to nginx if present
         def plausible(repo: str) -> bool:
             return "/" in repo or "." in repo or repo in {"nginx", "busybox", "alpine"}
         if cand and plausible(cand.lower()):
@@ -147,7 +178,7 @@ def _detect_allowed_keys(requirement: str) -> Dict[str, any]:
     # configMap path (e.g., /etc/nginx/conf.d/metrics.conf)
     configmap_path = None
     if "configmap" in txt:
-        p = re.search(r'(/[-/a-z0-9._]+\.conf)', requirement, re.IGNORECASE) or re.search(r'(/[-/a-z0-9._]+)', requirement, re.IGNORECASE)
+        p = re.search(r'(/[-/a-z0-9._]+\.conf)\b', requirement, re.IGNORECASE) or re.search(r'(/[-/a-z0-9._]+)\b', requirement, re.IGNORECASE)
         if p:
             configmap_path = p.group(1)
         allowed.add("configMaps")
@@ -171,20 +202,16 @@ def _detect_allowed_keys(requirement: str) -> Dict[str, any]:
         "readiness_path": readiness_path,
         "image_repo": image_repo,
         "image_tag": image_tag,
-        "configmap_path": configmap_path,  # NEW
+        "configmap_path": configmap_path,
     }
 
 _KEY_RE = re.compile(r'^([A-Za-z0-9._-]+):(?:\s|$)')
 
 def _filter_yaml_top_sections(yaml_text: str, allowed: set[str]) -> str:
-    """
-    Remove any top-level sections that are not in 'allowed'.
-    """
     lines = yaml_text.splitlines()
     out = []
     skip = False
-    for i, line in enumerate(lines):
-        # new top-level?
+    for line in lines:
         if line and not line.startswith((" ", "\t")) and not line.lstrip().startswith("#"):
             m = _KEY_RE.match(line)
             if m:
@@ -192,13 +219,9 @@ def _filter_yaml_top_sections(yaml_text: str, allowed: set[str]) -> str:
                 skip = key not in allowed
         if not skip:
             out.append(line)
-    # strip trailing blank lines
     return "\n".join(out).strip()
 
-def _schema_union(schema_summary: Dict[str, Dict]) -> Dict[str, set]:  # NEW
-    """
-    Union of schema across files: top-level -> set(second-level keys)
-    """
+def _schema_union(schema_summary: Dict[str, Dict]) -> Dict[str, set]:
     union: Dict[str, set] = {}
     for _, outline in (schema_summary or {}).items():
         for top, children in outline.items():
@@ -208,10 +231,7 @@ def _schema_union(schema_summary: Dict[str, Dict]) -> Dict[str, set]:  # NEW
                 union[top].add(c)
     return union
 
-def _canonical_paths(union: Dict[str, set]) -> Dict[str, str]:  # NEW
-    """
-    Best-effort canonical paths for common features based on observed schema.
-    """
+def _canonical_paths(union: Dict[str, set]) -> Dict[str, str]:
     paths = {}
     # metrics
     if "global" in union and "app" in union["global"]:
@@ -219,7 +239,7 @@ def _canonical_paths(union: Dict[str, set]) -> Dict[str, str]:  # NEW
     elif "global" in union:
         paths["metrics"] = "global.monitoring"
     else:
-        paths["metrics"] = "global.app.monitoring"  # default
+        paths["metrics"] = "global.app.monitoring"
     # ingresses
     if "global" in union and "ingresses" in union["global"]:
         paths["ingresses"] = "global.ingresses.main.hosts"
@@ -231,7 +251,7 @@ def _canonical_paths(union: Dict[str, set]) -> Dict[str, str]:  # NEW
     paths["readiness"] = "probes.readiness"
     return paths
 
-def _build_llm_prompt(ctx: str, requirement: str, req_info: Dict, union: Dict[str, set], paths: Dict[str, str]) -> str:  # NEW
+def _build_llm_prompt(ctx: str, requirement: str, req_info: Dict, union: Dict[str, set], paths: Dict[str, str]) -> str:
     allowed_tops = sorted(list(req_info.get("allowed", set())))
     schema_lines = []
     for top in sorted(union.keys()):
@@ -268,28 +288,19 @@ def _build_llm_prompt(ctx: str, requirement: str, req_info: Dict, union: Dict[st
         f"Produce only YAML for values/common.yaml matching the above."
     )
 
-def _first_yaml_block(text: str) -> str | None:  # NEW
-    """
-    Find the first block that looks like YAML starting at a top-level key (e.g., "global:").
-    """
+def _first_yaml_block(text: str) -> str | None:
     lines = text.splitlines()
     start = None
     for i, line in enumerate(lines):
         s = line.lstrip()
-        # ignore markdown/prose lines until a plausible yaml key appears
         if _KEY_RE.match(s):
             start = i
             break
     if start is None:
         return None
-    block = "\n".join(lines[start:]).strip()
-    return block or None
+    return "\n".join(lines[start:]).strip() or None
 
 def _extract_yaml(text: str) -> str | None:
-    """
-    Extract YAML from a response. Prefer fenced code blocks if present.
-    Then fallback to the first YAML-like block starting at a top-level key.
-    """
     if not text:
         return None
     m = re.search(r"```(?:yaml|yml)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
@@ -300,21 +311,10 @@ def _extract_yaml(text: str) -> str | None:
         return block
     return text.strip()
 
-def _has_helm_templates(text: str) -> bool:  # NEW
-    """
-    Best-effort detection of Helm/Go templates.
-    """
-    if not text:
-        return False
-    return ("{{" in text and "}}" in text)
+def _has_helm_templates(text: str) -> bool:
+    return bool(text) and ("{{" in text and "}}" in text)
 
-def _parse_yaml(text: str, verbose: bool = False) -> Dict | None:  # CHANGED
-    """
-    Lenient YAML parsing with Helm template sanitization and multi-document support.
-    - Comments out standalone template-only lines.
-    - Quotes inline {{ ... }} occurrences.
-    - Tries yaml.safe_load_all and merges dict docs (last-wins).
-    """
+def _parse_yaml(text: str, verbose: bool = False) -> Dict | None:
     def _strip_fences(src: str) -> str:
         if not src:
             return src
@@ -332,7 +332,6 @@ def _parse_yaml(text: str, verbose: bool = False) -> Dict | None:  # CHANGED
             else:
                 out_lines.append(ln)
         src2 = "\n".join(out_lines)
-        # Quote unquoted inline templates
         src2 = re.sub(r'(?<!")(\{\{[^}]+}})(?!")', r'"\1"', src2)
         return src2
 
@@ -345,25 +344,23 @@ def _parse_yaml(text: str, verbose: bool = False) -> Dict | None:  # CHANGED
 
     try:
         clean = _strip_fences(text)
-        # Try multi-doc first
         docs = list(yaml.safe_load_all(clean))
         if docs:
             merged = _merge_docs(docs)
             if merged is not None:
                 return merged
-        # Fallback single-doc
         doc = yaml.safe_load(clean)
         return doc if isinstance(doc, dict) else None
     except Exception as e:
         if verbose:
             preview = (text[:300] + "...") if len(text) > 300 else text
             print(f"[gen] yaml parse error: {e}\n[gen] yaml preview:\n{preview}")
-        # Retry with sanitization
         try:
             clean = _strip_fences(text)
             sanitized = _sanitize(clean)
             if verbose:
-                print("[gen] sanitized YAML for retry:\n" + (sanitized[:1000] + ("..." if len(sanitized) > 1000 else "")))
+                prev = sanitized[:1000] + ("..." if len(sanitized) > 1000 else "")
+                print("[gen] sanitized YAML for retry:\n" + prev)
             docs = list(yaml.safe_load_all(sanitized))
             if docs:
                 merged = _merge_docs(docs)
@@ -376,7 +373,7 @@ def _parse_yaml(text: str, verbose: bool = False) -> Dict | None:  # CHANGED
                 print(f"[gen] retry parse failed: {e2}")
             return None
 
-def _set_path(doc: Dict, dotted: str, value) -> None:  # NEW
+def _set_path(doc: Dict, dotted: str, value) -> None:
     cur = doc
     parts = dotted.split(".")
     for p in parts[:-1]:
@@ -385,13 +382,11 @@ def _set_path(doc: Dict, dotted: str, value) -> None:  # NEW
         cur = cur[p]
     cur[parts[-1]] = value
 
-def _ensure_required_parts(doc: Dict, req_info: Dict, paths: Dict[str, str], verbose: bool = False) -> None:  # NEW
-    # metrics
+def _ensure_required_parts(doc: Dict, req_info: Dict, paths: Dict[str, str], verbose: bool = False) -> None:
     m = req_info.get("metrics")
     if m and (m.get("path") or m.get("port") is not None):
         mon_path = paths["metrics"]
-        node = {}
-        node["activate"] = True
+        node: Dict[str, any] = {"activate": True}
         if m.get("path"):
             node["path"] = m["path"]
         if m.get("port") is not None:
@@ -399,13 +394,11 @@ def _ensure_required_parts(doc: Dict, req_info: Dict, paths: Dict[str, str], ver
         _set_path(doc, mon_path, node)
         if verbose:
             print(f"[gen] ensured metrics at {mon_path}")
-    # hosts/ingresses
     hosts = req_info.get("hosts") or []
     if hosts:
         _set_path(doc, paths["ingresses"], hosts)
         if verbose:
             print(f"[gen] ensured hosts at {paths['ingresses']}: {hosts}")
-    # image
     repo = req_info.get("image_repo")
     if "image" in req_info.get("allowed", set()) and repo:
         img = {"repository": repo}
@@ -415,10 +408,7 @@ def _ensure_required_parts(doc: Dict, req_info: Dict, paths: Dict[str, str], ver
         if verbose:
             print(f"[gen] ensured image at {paths['image']}: {repo}")
 
-def _prune_to_allowed_and_schema(doc: Dict, allowed: set[str], union: Dict[str, set], verbose: bool = False) -> Dict:  # NEW
-    """
-    Keep only allowed top-level keys and known child keys from the union schema.
-    """
+def _prune_to_allowed_and_schema(doc: Dict, allowed: set[str], union: Dict[str, set], verbose: bool = False) -> Dict:
     if not isinstance(doc, dict):
         return {}
     pruned = {}
@@ -426,7 +416,6 @@ def _prune_to_allowed_and_schema(doc: Dict, allowed: set[str], union: Dict[str, 
         if allowed and top not in allowed:
             continue
         if top not in union:
-            # keep unknown top if explicitly allowed; else drop
             if allowed and top in allowed:
                 pruned[top] = val
             continue
@@ -436,7 +425,6 @@ def _prune_to_allowed_and_schema(doc: Dict, allowed: set[str], union: Dict[str, 
             for k, v in val.items():
                 if not allowed_children or k in allowed_children or not isinstance(v, dict):
                     pruned[top][k] = v
-            # drop empty dicts
             if pruned[top] == {}:
                 del pruned[top]
         else:
@@ -446,10 +434,10 @@ def _prune_to_allowed_and_schema(doc: Dict, allowed: set[str], union: Dict[str, 
         print(f"[gen] pruned top-level keys to: {kept if kept else '(none)'}")
     return pruned
 
-def _dump_yaml(doc: Dict) -> str:  # NEW
+def _dump_yaml(doc: Dict) -> str:
     return yaml.safe_dump(doc, sort_keys=False)
 
-def _ollama_generate(prompt: str, ctx: str, verbose: bool = False) -> str | None:  # CHANGED
+def _ollama_generate(prompt: str, ctx: str, verbose: bool = False) -> str | None:
     """
     Call local Ollama HTTP API directly (fast path) with small timeouts and no streaming.
     Respects OLLAMA_MODE=(chat|generate|auto) and OLLAMA_MODEL.
@@ -457,9 +445,8 @@ def _ollama_generate(prompt: str, ctx: str, verbose: bool = False) -> str | None
     mode = _ollama_mode()
     model = _ollama_model()
     opts = _ollama_options(temperature=0.2)
-    # Very small local timeouts: connect=0.5s, read=60s (tunable via env)
-    t_connect = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "0.5"))
-    t_read = float(os.getenv("OLLAMA_READ_TIMEOUT", "60"))
+    t_connect = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "0.2"))
+    t_read = float(os.getenv("OLLAMA_READ_TIMEOUT", "20"))
     timeout = (t_connect, t_read)
 
     def call_chat() -> str | None:
@@ -471,11 +458,14 @@ def _ollama_generate(prompt: str, ctx: str, verbose: bool = False) -> str | None
             ],
             "stream": False,
             "options": opts,
-            "keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "2m"),
+            "keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "30m"),
         }
-        data = _ollama_http("/api/chat", payload, timeout, verbose=verbose)
+        data = _ollama_http("/api/chat", payload, timeout, verbose=verbose, kind="chat")
         if data and "message" in data and isinstance(data["message"], dict):
             return data["message"].get("content")
+        if data and "choices" in data and isinstance(data["choices"], list) and data["choices"]:
+            msg = data["choices"][0].get("message") or {}
+            return msg.get("content")
         return None
 
     def call_generate() -> str | None:
@@ -484,11 +474,15 @@ def _ollama_generate(prompt: str, ctx: str, verbose: bool = False) -> str | None
             "prompt": f"{GEN_SYS_PROMPT}\n\n{prompt}",
             "stream": False,
             "options": opts,
-            "keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "2m"),
+            "keep_alive": os.getenv("OLLAMA_KEEP_ALIVE", "30m"),
         }
-        data = _ollama_http("/api/generate", payload, timeout, verbose=verbose)
+        data = _ollama_http("/api/generate", payload, timeout, verbose=verbose, kind="generate")
         if data and "response" in data:
             return data["response"]
+        if data and "choices" in data and isinstance(data["choices"], list) and data["choices"]:
+            txt = data["choices"][0].get("text")
+            if isinstance(txt, str) and txt:
+                return txt
         return None
 
     if mode == "chat":
@@ -501,10 +495,7 @@ def _ollama_generate(prompt: str, ctx: str, verbose: bool = False) -> str | None
         return out
     return call_generate()
 
-def _minimal_template(req_info: Dict, paths: Dict[str, str]) -> str:  # NEW
-    """
-    Minimal YAML strictly from requested intents; does not depend on external modules.
-    """
+def _minimal_template(req_info: Dict, paths: Dict[str, str]) -> str:
     allowed = req_info.get("allowed", set())
     m = req_info.get("metrics") or {}
     hosts = req_info.get("hosts") or []
@@ -512,13 +503,11 @@ def _minimal_template(req_info: Dict, paths: Dict[str, str]) -> str:  # NEW
     repo = req_info.get("image_repo")
     tag = req_info.get("image_tag")
     doc: Dict[str, any] = {}
-    # image
     if "image" in allowed and repo:
         node = {"repository": repo}
         if tag:
             node["tag"] = tag
         _set_path(doc, paths.get("image", "image"), node)
-    # metrics
     if "global" in allowed and (m.get("path") or (m.get("port") is not None)):
         mon = {"activate": True}
         if m.get("path"):
@@ -526,13 +515,10 @@ def _minimal_template(req_info: Dict, paths: Dict[str, str]) -> str:  # NEW
         if m.get("port") is not None:
             mon["port"] = m["port"]
         _set_path(doc, paths.get("metrics", "global.app.monitoring"), mon)
-    # ingresses
     if "global" in allowed and hosts:
         _set_path(doc, paths.get("ingresses", "global.ingresses.main.hosts"), hosts)
-    # probes
     if "probes" in allowed and readiness_path:
         _set_path(doc, paths.get("readiness", "probes.readiness"), {"activate": True, "path": readiness_path})
-    # configMaps (optional; emit if requested and path present in req_info)
     if "configMaps" in allowed and req_info.get("configmap_path"):
         fpath = str(req_info["configmap_path"])
         if "/" in fpath:
@@ -545,9 +531,7 @@ def _minimal_template(req_info: Dict, paths: Dict[str, str]) -> str:  # NEW
             "triggerReload": True,
             "mountPath": d or "/etc",
             "subPath": fn or "config.conf",
-            "content": {
-                (fn or "config.conf"): "# generated by minimal template; replace with real content"
-            }
+            "content": {fn or "config.conf": "# generated by minimal template; replace with real content"},
         }
     return _dump_yaml(doc).strip()
 
@@ -555,9 +539,6 @@ def generate_yaml(requirement: str,
                   retrieved: List[Tuple[float, Dict, str]],
                   schema_summary: Dict[str, Dict],
                   verbose: bool = False) -> str:
-    # Use the first schema as representative for fallback
-    any_schema = next(iter(schema_summary.values())) if schema_summary else {}
-
     # Detect allowed keys/features from requirement
     req_info = _detect_allowed_keys(requirement)
     allowed = req_info["allowed"]
@@ -573,29 +554,26 @@ def generate_yaml(requirement: str,
             tag = req_info.get("image_tag")
             print(f"[gen] image: {req_info['image_repo']}{(':'+tag) if tag else ''}")
 
-    # Build schema union and canonical paths
     union = _schema_union(schema_summary)
     paths = _canonical_paths(union)
 
-    # Build a compact, intent-focused context to keep prompts fast
-    ctx = compose_context(retrieved, schema_summary, req_info, verbose=verbose)  # NEW
+    ctx = compose_context(retrieved, schema_summary, req_info, verbose=verbose)
 
-    # LLM-first prompt
     llm_prompt = _build_llm_prompt(
-        ctx=ctx,  # CHANGED
+        ctx=ctx,
         requirement=requirement,
         req_info=req_info,
         union=union,
         paths=paths
     )
 
-    if verbose:  # NEW
+    if verbose:
         lines = llm_prompt.count("\n") + 1
         print(f"[gen] prompt size: {len(llm_prompt)} chars, {lines} lines")
 
-    # Robust retry with backoff and timing logs
-    max_retries = max(1, int(os.getenv("OLLAMA_MAX_RETRIES", "2")))  # CHANGED default 2
-    delay = 0.25  # CHANGED: faster initial backoff
+    # Fast retries (default 1)
+    max_retries = max(1, int(os.getenv("OLLAMA_MAX_RETRIES", "1")))
+    delay = 0.25
     out = None
     for attempt in range(1, max_retries + 1):
         t0 = time.monotonic()
@@ -632,34 +610,28 @@ def generate_yaml(requirement: str,
         raw_yaml = _extract_yaml(out)
         if verbose and raw_yaml and raw_yaml != out:
             print(f"[gen] extracted yaml preview: {(raw_yaml[:300] + '...') if len(raw_yaml) > 300 else raw_yaml}")
-
         raw_text = (raw_yaml or out or "").strip()
 
-        # LENIENT mode: if Helm templates are present, preserve raw YAML and skip parsing/pruning
         lenient = os.getenv("LENIENT_YAML", "1").lower() not in ("0", "false", "no")
         if lenient and _has_helm_templates(raw_text):
             if verbose:
                 print("[gen] lenient mode active and Helm templates detected -> returning raw YAML unchanged")
             return raw_text
 
-        # Strict parse path with sanitization and multi-doc merge
         doc = _parse_yaml(raw_text, verbose=verbose)
         if doc is None:
             if verbose:
                 print("[gen] parsing failed; preserving raw YAML (no fallback)")
-            return raw_text  # keep full output instead of minimal fallback
+            return raw_text
 
-        # prune to requested and schema-known keys
         pruned = _prune_to_allowed_and_schema(doc, allowed, union, verbose=verbose)
-        # ensure explicitly requested parts exist
         _ensure_required_parts(pruned, req_info, paths, verbose=verbose)
         dumped = _dump_yaml(pruned).strip()
         if verbose:
             print(f"[gen] output length: {len(dumped)} chars")
         return dumped
 
-    # Final fallback path (never crash)
-    allow_fb = os.getenv("GEN_ALLOW_FALLBACK", "1").lower() not in ("0", "false", "no")  # NEW
+    allow_fb = os.getenv("GEN_ALLOW_FALLBACK", "1").lower() not in ("0", "false", "no")
     if verbose:
         print("[gen] LLM generation failed after retries")
         print(f"[gen] fallback allowed: {allow_fb}")
@@ -667,6 +639,5 @@ def generate_yaml(requirement: str,
         warn = "[gen] WARNING: using minimal template fallback due to LLM failure"
         print(warn)
         return _minimal_template(req_info, paths)
-    # Fallback disabled: still avoid crashing; return a minimal stub
     print("[gen] ERROR: LLM generation failed and fallback is disabled; returning empty YAML")
     return ""
